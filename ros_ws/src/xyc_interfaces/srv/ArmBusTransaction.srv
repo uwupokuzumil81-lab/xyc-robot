@@ -1,0 +1,12 @@
+# Internal seven-joint bus transaction. A coordinator must prepare both arms
+# before committing either; commits and hardware writes are not atomic.
+string operation
+string session_id
+uint64 token
+builtin_interfaces/Time expires_at
+float64[7] targets
+---
+bool success
+string session_id
+string state
+string message

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xyc-robot"
+version = "0.2.0"
+description = "XYC robot learning adapters, training and inference"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6"]
+
+[project.optional-dependencies]
+replay = ["numpy>=1.26,<3", "pyarrow>=17,<24"]
+act = ["torch==2.7.1", "torchvision==0.22.1", "einops==0.8.1", "safetensors>=0.4,<1",
+       "numpy>=1.26,<3", "opencv-python>=4.9,<5", "pyarrow>=17,<24", "av>=14,<17"]
+
+[project.scripts]
+xyc-learning = "xyc.learning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"xyc.models.act" = ["LICENSE", "PROVENANCE.json"]

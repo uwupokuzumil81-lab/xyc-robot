@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "arm": "right",
+  "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79015598-if00",
+  "ticks_per_revolution": 4096,
+  "coordinate_system": "servo_reference_and_range_not_urdf",
+  "source": "passive_recording",
+  "created_at_utc": "2026-11-05T07:59:24.098547+00:00",
+  "motors": {
+    "arm_right_shoulder_pan": {
+      "id": 1,
+      "model_number": 2825,
+      "hardware_homing_offset": -832,
+      "operating_mode": 0,
+      "reference_tick": 2011,
+      "min_delta_ticks": -952,
+      "max_delta_ticks": 1052,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_shoulder_lift": {
+      "id": 2,
+      "model_number": 2569,
+      "hardware_homing_offset": 1784,
+      "operating_mode": 0,
+      "reference_tick": 2114,
+      "min_delta_ticks": -1131,
+      "max_delta_ticks": 1143,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_elbow_flex": {
+      "id": 3,
+      "model_number": 2569,
+      "hardware_homing_offset": -1681,
+      "operating_mode": 0,
+      "reference_tick": 1941,
+      "min_delta_ticks": -1008,
+      "max_delta_ticks": 1159,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_wrist_flex": {
+      "id": 4,
+      "model_number": 2825,
+      "hardware_homing_offset": -1340,
+      "operating_mode": 0,
+      "reference_tick": 1961,
+      "min_delta_ticks": -1097,
+      "max_delta_ticks": 1014,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_wrist_yaw": {
+      "id": 5,
+      "model_number": 2825,
+      "hardware_homing_offset": 1453,
+      "operating_mode": 0,
+      "reference_tick": 2077,
+      "min_delta_ticks": -970,
+      "max_delta_ticks": 942,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_wrist_roll": {
+      "id": 6,
+      "model_number": 2825,
+      "hardware_homing_offset": 1678,
+      "operating_mode": 0,
+      "reference_tick": 1949,
+      "min_delta_ticks": -1055,
+      "max_delta_ticks": 1033,
+      "direction": 1,
+      "normalized_min": -100,
+      "normalized_max": 100
+    },
+    "arm_right_gripper": {
+      "id": 7,
+      "model_number": 2825,
+      "hardware_homing_offset": -1435,
+      "operating_mode": 0,
+      "reference_tick": 2053,
+      "min_delta_ticks": -46,
+      "max_delta_ticks": 1428,
+      "direction": 1,
+      "normalized_min": 0,
+      "normalized_max": 100
+    }
+  }
+}

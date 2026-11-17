@@ -1,0 +1,21 @@
+name: xyc
+channels:
+  - https://prefix.dev/robostack-jazzy
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - ros-jazzy-ros-base
+  - ros-jazzy-demo-nodes-py
+  - ros-jazzy-cv-bridge
+  - ros-jazzy-message-filters
+  - ros-jazzy-rosbag2-storage-mcap
+  - ros-jazzy-diagnostic-msgs
+  - ros-dev-tools
+  - ros-jazzy-rosidl-default-runtime
+  - ros-jazzy-rosidl-default-generators
+  - pyserial
+  - pyyaml
+  - opencv
+  - pytest
+  - pip

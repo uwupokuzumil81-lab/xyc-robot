@@ -1,0 +1,12 @@
+{
+  "upstream": "huggingface/lerobot",
+  "version": "v0.4.3",
+  "source_url": "https://raw.githubusercontent.com/huggingface/lerobot/v0.4.3/src/lerobot/policies/act/modeling_act.py",
+  "upstream_sha256": "69301fff11cbb8f4ba7bfe473a55ba488c3d2f89c25ecdfe512347a93b4ad04f",
+  "license": "Apache-2.0",
+  "changes": [
+    "Use local ACTConfig and platform constants",
+    "Replace PreTrainedPolicy with torch.nn.Module; platform owns serialization",
+    "Network forward, loss, transformer and temporal ensemble mathematics unchanged"
+  ]
+}

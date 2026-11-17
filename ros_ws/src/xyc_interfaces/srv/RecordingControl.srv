@@ -1,0 +1,7 @@
+# Idempotent recording-only command. It never enables or moves motors.
+string request_id
+string operation
+string config_json
+---
+bool accepted
+string message

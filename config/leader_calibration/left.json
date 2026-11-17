@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "profile": "am-leader-6dof",
+  "arm": "left",
+  "usb_serial": "5B79017577",
+  "ticks_per_revolution": 4096,
+  "hardware": {
+    "arm_left_shoulder_pan": {
+      "id": 1,
+      "model_number": 777,
+      "hardware_homing_offset": -1839,
+      "operating_mode": 0
+    },
+    "arm_left_shoulder_lift": {
+      "id": 2,
+      "model_number": 777,
+      "hardware_homing_offset": -1136,
+      "operating_mode": 0
+    },
+    "arm_left_elbow_flex": {
+      "id": 3,
+      "model_number": 777,
+      "hardware_homing_offset": -1967,
+      "operating_mode": 0
+    },
+    "arm_left_wrist_flex": {
+      "id": 4,
+      "model_number": 777,
+      "hardware_homing_offset": -185,
+      "operating_mode": 0
+    },
+    "arm_left_wrist_yaw": {
+      "id": 5,
+      "model_number": 777,
+      "hardware_homing_offset": -1114,
+      "operating_mode": 0
+    },
+    "arm_left_wrist_roll": {
+      "id": 6,
+      "model_number": 777,
+      "hardware_homing_offset": -354,
+      "operating_mode": 0
+    },
+    "arm_left_gripper": {
+      "id": 7,
+      "model_number": 777,
+      "hardware_homing_offset": 1125,
+      "operating_mode": 0
+    }
+  },
+  "ranges": {
+    "arm_left_shoulder_pan": {
+      "reference_tick": 1971,
+      "min_delta_ticks": -967,
+      "max_delta_ticks": 1055
+    },
+    "arm_left_shoulder_lift": {
+      "reference_tick": 2033,
+      "min_delta_ticks": -1230,
+      "max_delta_ticks": 1072
+    },
+    "arm_left_elbow_flex": {
+      "reference_tick": 1999,
+      "min_delta_ticks": -994,
+      "max_delta_ticks": 1080
+    },
+    "arm_left_wrist_flex": {
+      "reference_tick": 2131,
+      "min_delta_ticks": -1028,
+      "max_delta_ticks": 1027
+    },
+    "arm_left_wrist_yaw": {
+      "reference_tick": 2037,
+      "min_delta_ticks": -995,
+      "max_delta_ticks": 839
+    },
+    "arm_left_wrist_roll": {
+      "reference_tick": 2080,
+      "min_delta_ticks": -1246,
+      "max_delta_ticks": 1068
+    },
+    "arm_left_gripper": {
+      "reference_tick": 2056,
+      "min_delta_ticks": -16,
+      "max_delta_ticks": 1108
+    }
+  }
+}

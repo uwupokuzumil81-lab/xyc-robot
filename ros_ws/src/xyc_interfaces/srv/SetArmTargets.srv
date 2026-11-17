@@ -1,0 +1,11 @@
+# Arm-only targets. They do not control the base or lift.
+std_msgs/Header header
+string source_id
+uint64 sequence
+builtin_interfaces/Duration valid_for
+string[2] arm_calibration_ids
+# Left arm (six joints and gripper), then right arm (six joints and gripper).
+float64[14] position_normalized
+---
+bool accepted
+string message

@@ -1,0 +1,5 @@
+# PC leader calibration and teleoperation, on Windows or Linux.
+# ROS dependencies for the Raspberry Pi are declared in environment.yml.
+pyserial
+PyYAML
+-r requirements-recording.txt

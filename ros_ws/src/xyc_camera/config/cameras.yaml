@@ -1,0 +1,31 @@
+/camera/forward/camera_forward:
+  ros__parameters:
+    device: "/dev/v4l/by-id/usb-am_camera_forward_am_camera_forward_am_camera_forward-video-index0"
+    frame_id: "camera_forward_optical_frame"
+    width: 640
+    height: 480
+    fps: 30.0
+
+/camera/chest/camera_chest:
+  ros__parameters:
+    device: "/dev/v4l/by-id/usb-am_camera_chest_am_camera_chest_am_camera_chest-video-index0"
+    frame_id: "camera_chest_optical_frame"
+    width: 640
+    height: 480
+    fps: 30.0
+
+/camera/wrist_left/camera_wrist_left:
+  ros__parameters:
+    device: "/dev/v4l/by-id/usb-am_camera_wrist_left_am_camera_wrist_left_am_camera_wrist_left-video-index0"
+    frame_id: "camera_wrist_left_optical_frame"
+    width: 640
+    height: 480
+    fps: 30.0
+
+/camera/wrist_right/camera_wrist_right:
+  ros__parameters:
+    device: "/dev/v4l/by-id/usb-am_camera_wrist_right_am_camera_wrist_right_am_camera_wrist_right-video-index0"
+    frame_id: "camera_wrist_right_optical_frame"
+    width: 640
+    height: 480
+    fps: 30.0
