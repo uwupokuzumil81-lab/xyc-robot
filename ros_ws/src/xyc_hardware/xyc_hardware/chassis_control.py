@@ -1,37 +1,58 @@
-# SPDX-License-Identifier: Apache-2.0
 """Velocity axes on the existing left bus, with a local command watchdog."""
+
+from xyc.robot.profile import robot_profile
+# SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
 import json
 import math
 import time
 
-from geometry_msgs.msg import TwistStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from xyc_interfaces.msg import MobileState
+from xyc_interfaces.msg import MobileCommand, MobileState
 
-from xyc_hardware.arm_calibration import integer
-from xyc_hardware.arm_joint_control import (
-    ARM_CURRENT_RATINGS_A, JointDriver, confirm_temperature,
+from xyc.robot.calibration import integer
+from xyc_hardware.arm_joint_control import JointDriver
+from xyc_hardware.motor_safety import (
+    CurrentProtection, FEEDBACK_LOSS_GRACE_S,
+    MOTOR_TEMPERATURE_LIMIT_C, confirm_temperature,
 )
 from xyc_hardware.base_kinematics import OmniGeometry
-from xyc_hardware.feetech_reader import decode_feedback
+from xyc.robot.feetech import decode_feedback
 from xyc_hardware.lift_tracking import LiftGeometry, LiftTracker
-from xyc_hardware.replay_transport import MOBILE_ACTION_SCALE, STATE_NAMES, STATE_UNITS
+from xyc.contracts import (
+    COMMAND_VALIDITY_S, LIFT_SOFT_STOP_MARGIN_M, MOBILE_ACTION_SCALE, STATE_NAMES, STATE_UNITS, CommandExpired,
+    checked_mobile_action, physical_mobile_action,
+)
 
 
 AXIS_IDS = (8, 9, 10, 11)
 COMMAND_TIMEOUT_S = .30
-FEEDBACK_TIMEOUT_S = .20
 ENABLE_STATIONARY_WINDOW_S = .15
 ENABLE_STATIONARY_RANGE_TICKS = 2
 HOMING_SPEED_M_S = .010
 HOMING_CONTACT_WINDOW_S = .10
 HOMING_CONTACT_RANGE_TICKS = 2
+STATIONARY_MAX_SAMPLE_GAP_S = .060
 COMMAND_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+TELEOP_FAULT_TOPIC = '/teleop/control_fault'
+TELEOP_FAULT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                              reliability=ReliabilityPolicy.RELIABLE)
 CHASSIS_NOT_READY = 'chassis_not_ready: '
+
+
+def mobile_message(node, commands, *, stamp=None, expires_ns=None):
+    """Build the sole mobile command format used by every frontend."""
+    message = MobileCommand()
+    message.header.stamp = stamp if stamp is not None else node.get_clock().now().to_msg()
+    message.header.frame_id = 'base_link'
+    generated = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+    expires_ns = generated + int(COMMAND_VALIDITY_S * 1e9) if expires_ns is None else expires_ns
+    message.expires_at.sec, message.expires_at.nanosec = divmod(expires_ns, 1_000_000_000)
+    message.commands = [int(v) for v in checked_mobile_action(commands)]
+    return message
 
 
 class ChassisNotReady(ValueError):
@@ -81,7 +102,7 @@ class ChassisDriver(JointDriver):
                 f'底盘/升降 ID {motor_id} 寄存器 {address} 核对失败：目标 {data.hex()}，实际 {actual.hex()}'
             )
 
-    def write_velocities(self, values):
+    def write_velocities(self, values, *, deadline=None):
         if not values or any(i not in AXIS_IDS for i in values):
             raise ValueError('Velocity writes require chassis IDs 8..11')
         encoded = {}
@@ -91,7 +112,9 @@ class ChassisDriver(JointDriver):
             encoded[motor_id] = (abs(speed) | (0x8000 if speed < 0 else 0)).to_bytes(2, 'little')
         ids = tuple(sorted(encoded))
         payload = b''.join(bytes([i]) + encoded[i] for i in ids)
-        self._send_joint_packet(254, 0x83, b'\x2e\x02' + payload)
+        if deadline is not None and time.monotonic() >= deadline and any(values.values()):
+            raise CommandExpired('Mobile command expired before serial dispatch')
+        self._send_joint_packet(254, 0x83, b'\x2e\x02' + payload, deadline=deadline)
         self._send_joint_packet(254, 0x82, b'\x2e\x02' + bytes(ids))
         replies = self._receive(ids, 2, .025)
         failed = [i for i in ids if i not in replies or replies[i].servo_error
@@ -170,7 +193,7 @@ class ChassisControl:
         self.missing_feedback_detail = ''
         self.base = (0., 0., 0.)
         self.lift_speed = 0.
-        self.base_until = self.lift_until = 0.
+        self.mobile_until = 0.
         self.tracker = None
         self.height = None
         self.homing = ''
@@ -184,16 +207,18 @@ class ChassisControl:
         self.home_samples = deque()
         self.settle_samples = deque()
         self.sent = {}
-        self.high_current_since = {}
+        self.current_protection = {
+            i: CurrentProtection(2569 if i == 11 else 2825) for i in AXIS_IDS
+        }
         self.next_torque_check = 0.
-        self.max_base_speed = .20
+        self.max_base_speed = math.hypot(*MOBILE_ACTION_SCALE[1:3])
         self.max_yaw_speed = .80
         self.max_lift_speed = .020
 
     def enable(self):
         if self.enabled:
             return
-        if self.last_feedback is None or self.clock() - self.last_feedback > .2:
+        if self.last_feedback is None or self.clock() - self.last_feedback > FEEDBACK_LOSS_GRACE_S:
             raise ChassisNotReady('等待底盘和升降的新鲜反馈')
         if self.driver.velocity_owned:
             # Only clean axes this same driver attempted to enable. Never adopt
@@ -214,13 +239,17 @@ class ChassisControl:
         self.base = (0., 0., 0.)
         self.lift_speed = 0.
         self.sent = dict.fromkeys(AXIS_IDS, 0)
-        self.high_current_since.clear()
+        self.reset_current_protection()
         self.reason = '已使能；升降先按 H 回零，再用 I/K 控制'
         self.next_torque_check = self.clock() + .5
 
+    def reset_current_protection(self):
+        for monitor in self.current_protection.values():
+            monitor.reset()
+
     def stationary_status(self):
         rows = list(self.standstill_samples)
-        if (len(rows) < 2 or self.clock() - rows[-1][0] > FEEDBACK_TIMEOUT_S
+        if (len(rows) < 2 or self.clock() - rows[-1][0] > FEEDBACK_LOSS_GRACE_S
                 or rows[-1][0] - rows[0][0] < ENABLE_STATIONARY_WINDOW_S):
             return False, '等待连续0.15秒的完整底盘/升降静止反馈'
         for motor_id in AXIS_IDS:
@@ -231,45 +260,45 @@ class ChassisControl:
                 return False, f'使能前ID {motor_id}仍在移动：编码器窗口跨度 {span} 刻度'
         return True, ''
 
-    def set_base(self, x, y, yaw):
-        if not all(math.isfinite(v) for v in (x, y, yaw)):
-            raise ValueError('底盘速度必须为有限数值')
-        if math.hypot(x, y) > self.max_base_speed or abs(yaw) > self.max_yaw_speed:
-            raise ValueError('底盘速度超过配置上限')
-        if self.feedback_paused:
-            raise ValueError(self.reason)
-        if not self.enabled or self.fault or self.homing:
-            raise ValueError('底盘未使能、存在故障或升降正在回零')
-        self.geometry.body_to_wheels(x, y, yaw)
-        self.base = (x, y, yaw)
-        self.base_until = self.clock() + COMMAND_TIMEOUT_S
-
-    def set_lift(self, speed):
-        if not math.isfinite(speed) or abs(speed) > self.max_lift_speed:
-            raise ValueError('升降速度超过配置上限')
-        if not self.enabled or self.fault:
-            raise ValueError('升降未使能或存在故障')
-        if self.feedback_paused:
-            raise ValueError(self.reason)
+    def set_mobile(self, commands, *, deadline):
+        """Preflight and apply a single four-axis target under one deadline."""
+        lift, x, y, yaw = physical_mobile_action(commands)
+        now = self.clock()
+        if not math.isfinite(deadline) or now >= deadline:
+            raise CommandExpired('Mobile command expired before acceptance')
+        if not self.enabled or self.fault or self.feedback_paused:
+            raise ValueError(self.reason or '底盘/升降未就绪')
+        if self.last_feedback is None or now - self.last_feedback >= FEEDBACK_LOSS_GRACE_S:
+            raise ValueError('底盘/升降反馈已过期')
         if self.homing:
-            # A fresh, valid command confirms the operator connection even
-            # when its requested direction must wait for homing to finish.
-            self.home_until = self.clock() + COMMAND_TIMEOUT_S
-            if speed:
-                self.reason = '升降正在回零，完成后才能使用 I/K；空格可停止'
+            self.home_until = min(deadline, now + COMMAND_TIMEOUT_S)
+            if any((lift, x, y, yaw)):
+                self.reason = '升降回零中，方向目标已忽略，空格可停止'
             return
-        if speed and self.tracker is None:
+        if lift and self.tracker is None:
             raise ValueError('升降零点尚未建立，请先按 H 回零')
-        if speed:
+        if (math.hypot(x, y) > self.max_base_speed or abs(yaw) > self.max_yaw_speed
+                or abs(lift) > self.max_lift_speed):
+            raise ValueError('移动目标超过配置上限')
+        base = self.geometry.constrain_body_velocity(x, y, yaw)
+        if lift:
             self.driver.enable_lift()
-            if speed * self.lift_speed <= 0:
-                self.lift_progress_tick = self.samples[11]['position_ticks']
-                self.lift_progress_at = self.clock()
-        self.lift_speed = speed
-        self.lift_until = self.clock() + COMMAND_TIMEOUT_S
+        now = self.clock()
+        if now >= deadline:
+            self.clear_target()
+            raise CommandExpired('Mobile command expired during preparation')
+        if lift and lift * self.lift_speed <= 0:
+            self.lift_progress_tick = self.samples[11]['position_ticks']
+            self.lift_progress_at = now
+        self.base, self.lift_speed = base, lift
+        self.mobile_until = min(deadline, now + COMMAND_TIMEOUT_S)
+
+    def clear_target(self):
+        self.base, self.lift_speed = (0., 0., 0.), 0.
+        self.mobile_until = 0.
 
     def stop(self):
-        self.base, self.lift_speed = (0., 0., 0.), 0.
+        self.clear_target()
         if self.homing:
             self.homing = ''
             self.tracker, self.height = None, None
@@ -289,7 +318,7 @@ class ChassisControl:
             self.reason = ('升降正在下行回零，请等待完成；空格可停止'
                            if self.homing == 'seeking' else '升降正在等待回零稳定；空格可停止')
             return  # A repeated H must not restart motion or reset its deadline.
-        if self.last_feedback is None or self.clock() - self.last_feedback > .2:
+        if self.last_feedback is None or self.clock() - self.last_feedback > FEEDBACK_LOSS_GRACE_S:
             raise ValueError('升降反馈过期')
         self.stop()
         self.driver.enable_lift()
@@ -334,14 +363,12 @@ class ChassisControl:
             self.missing_feedback_ids = missing
             self.missing_feedback_detail = missing_detail
             if self.enabled:
-                if self.last_feedback is None or now - self.last_feedback >= FEEDBACK_TIMEOUT_S:
+                if self.last_feedback is None or now - self.last_feedback >= FEEDBACK_LOSS_GRACE_S:
                     self.fail(self.feedback_timeout_reason())
                     return
                 # Do not drive from a stale sample. Pause velocities immediately
                 # without throwing away a still-unambiguous lift reference.
-                self.base, self.lift_speed = (0., 0., 0.), 0.
-                self.base_until = self.lift_until = 0.
-                self.high_current_since.clear()
+                self.clear_target()
                 self.home_stationary = None
                 self.home_samples.clear()
                 self.settle_samples.clear()
@@ -357,15 +384,14 @@ class ChassisControl:
                 self.feedback_paused = True
                 self.reason = f'反馈暂缺 ID {list(missing)}，速度已暂停，等待新反馈'
             return
-        if self.enabled and self.feedback_paused and now - self.last_feedback >= FEEDBACK_TIMEOUT_S:
+        if self.enabled and self.feedback_paused and now - self.last_feedback >= FEEDBACK_LOSS_GRACE_S:
             self.fail(self.feedback_timeout_reason())
             return
         recovered = self.feedback_paused
         self.feedback_paused = False
         self.missing_feedback_ids = ()
         self.missing_feedback_detail = ''
-        if self.last_feedback is not None and now - self.last_feedback > .06:
-            self.high_current_since.clear()
+        if self.last_feedback is not None and now - self.last_feedback > STATIONARY_MAX_SAMPLE_GAP_S:
             self.home_samples.clear()
             self.standstill_samples.clear()
         self.standstill_samples.append((now, {i: samples[i]['position_ticks'] for i in AXIS_IDS}))
@@ -381,21 +407,12 @@ class ChassisControl:
             for motor_id in AXIS_IDS:
                 sample = samples[motor_id]
                 self.check_temperature(motor_id, sample)
-                current = abs(sample['current_a'])
-                rated, stall = ARM_CURRENT_RATINGS_A[2569 if motor_id == 11 else 2825]
-                for limit, duration in ((2 * rated, .65), (.8 * stall, .08)):
-                    key = (motor_id, limit)
-                    if current < limit:
-                        self.high_current_since.pop(key, None)
-                    else:
-                        self.high_current_since.setdefault(key, now)
-                        if now - self.high_current_since[key] >= duration:
-                            raise ValueError(
-                                f'ID {motor_id} 持续过流：{current:.2f} A；'
-                                f'阈值 {limit:.2f} A，持续 {now - self.high_current_since[key]:.3f}s；'
-                                f'回零阶段 {self.homing or "无"}，'
-                                f'位置 {sample["position_ticks"]}，速度读数 {sample["velocity_raw"]}'
-                            )
+                reason = self.current_protection[motor_id].observe(sample['current_a'], now)
+                if reason:
+                    raise ValueError(
+                        f'ID {motor_id} 持续过流：{reason}；回零阶段 {self.homing or "无"}，'
+                        f'位置 {sample["position_ticks"]}，速度读数 {sample["velocity_raw"]}'
+                    )
             if now >= self.next_torque_check:
                 for motor_id in self.driver.velocity_owned:
                     if self.driver.axis_read(motor_id, 40, 1) != b'\x01':
@@ -407,7 +424,7 @@ class ChassisControl:
                 self._observe_home(now)
             elif self.tracker is not None:
                 self.height = self.tracker.update(samples[11]['position_ticks'], now)
-                if self.lift_speed and now < self.lift_until and self.sent.get(11):
+                if self.lift_speed and now < self.mobile_until and self.sent.get(11):
                     tick = samples[11]['position_ticks']
                     delta = (tick - self.lift_progress_tick + 2048) % 4096 - 2048
                     direction = self.lift_geometry.direction * (1 if self.lift_speed > 0 else -1)
@@ -415,19 +432,19 @@ class ChassisControl:
                         self.lift_progress_tick, self.lift_progress_at = tick, now
                     elif now - self.lift_progress_at >= .75:
                         raise ValueError('升降持续未向指令方向移动，请检查行程端部和机构')
-            base = self.base if now < self.base_until and not self.homing else (0., 0., 0.)
+            base = self.base if now < self.mobile_until and not self.homing else (0., 0., 0.)
             speeds = dict(zip((8, 9, 10), (
                 round(v * 4096 / math.tau) for v in self.geometry.body_to_wheels(*base)
             )))
-            lift_speed = self.lift_speed if now < self.lift_until else 0.
+            lift_speed = self.lift_speed if now < self.mobile_until else 0.
             if self.homing == 'seeking':
                 speeds[11] = round(-self.lift_geometry.direction * HOMING_SPEED_M_S * 4096 /
                                    self.lift_geometry.lead_m_per_revolution)
             elif self.homing == 'settling' or self.height is None:
                 speeds[11] = 0
             else:
-                if (lift_speed < 0 and self.height <= .005
-                        or lift_speed > 0 and self.height >= self.lift_geometry.max_height_m - .005):
+                if (lift_speed < 0 and self.height <= LIFT_SOFT_STOP_MARGIN_M
+                        or lift_speed > 0 and self.height >= self.lift_geometry.max_height_m - LIFT_SOFT_STOP_MARGIN_M):
                     lift_speed = 0.
                     self.reason = '升降已到软件行程边界'
                 speeds[11] = round(lift_speed * 4096 /
@@ -435,7 +452,18 @@ class ChassisControl:
             changed = {i: v for i, v in speeds.items()
                        if i in self.driver.velocity_owned and self.sent.get(i) != v}
             if changed:
-                self.driver.write_velocities(changed)
+                deadline = None
+                if any(changed.values()):
+                    deadline = self.home_until if self.homing == 'seeking' else self.mobile_until
+                try:
+                    self.driver.write_velocities(changed, deadline=deadline)
+                    if deadline is not None and self.clock() >= deadline and any(changed.values()):
+                        raise CommandExpired('Mobile command expired during serial confirmation')
+                except CommandExpired:
+                    self.clear_target()
+                    self.reason = '移动命令已过期，已停车；等待新指令'
+                    changed = dict.fromkeys(self.driver.velocity_owned, 0)
+                    self.driver.write_velocities(changed)
                 self.sent.update(changed)
         except (OSError, ValueError, RuntimeError) as exc:
             self.fail(str(exc))
@@ -443,7 +471,7 @@ class ChassisControl:
     def check_temperature(self, motor_id, sample):
         if not all(math.isfinite(sample[k]) for k in ('current_a', 'temperature_c')):
             raise ValueError(f'ID {motor_id} 电流/温度反馈无效')
-        if sample['temperature_c'] >= 55:
+        if sample['temperature_c'] >= MOTOR_TEMPERATURE_LIMIT_C:
             confirm_temperature(
                 sample, read_temperature=lambda: self.driver.axis_read(motor_id, 63, 1)[0],
                 read_feedback=lambda: decode_feedback(self.driver.axis_read(motor_id, 56, 15)),
@@ -521,26 +549,26 @@ class ChassisRos:
         self.node = node
         def parameter(name, default):
             return node.declare_parameter(name, default).value
+        defaults = robot_profile().geometry
         geometry = OmniGeometry(
-            parameter('wheel_radius_m', .063), parameter('base_radius_m', .195),
-            tuple(math.radians(v) for v in parameter('wheel_angles_deg', [150., -90., 30.])),
-            tuple(parameter('wheel_signs', [1, 1, 1])), 3000 * math.tau / 4096,
+            parameter('wheel_radius_m', defaults['wheel_radius_m']), parameter('base_radius_m', defaults['base_radius_m']),
+            tuple(math.radians(v) for v in parameter('wheel_angles_deg', defaults['wheel_angles_deg'])),
+            tuple(parameter('wheel_signs', defaults['wheel_signs'])), 3000 * math.tau / 4096,
         )
-        lift = LiftGeometry(parameter('lift_lead_m_per_revolution', .131),
-                            parameter('lift_direction', -1), 4000., .2,
-                            0., parameter('lift_max_height_m', .6))
+        lift = LiftGeometry(parameter('lift_lead_m_per_revolution', defaults['lift_lead_m_per_revolution']),
+                            parameter('lift_direction', defaults['lift_direction']), 4000., .2,
+                            0., parameter('lift_max_height_m', defaults['lift_max_height_m']))
         self.control = ChassisControl(driver, geometry, lift)
         self.status = node.create_publisher(String, '/robot/chassis/status', 1)
         self.state_publisher = node.create_publisher(
             MobileState, '/robot/chassis/state', COMMAND_QOS)
         self.recording_command_publisher = node.create_publisher(
             String, '/robot/chassis/recording_command', COMMAND_QOS)
-        self.recording_requests = {}
-        self.last_recording_command_ns = 0
-        self.base_sub = node.create_subscription(TwistStamped, '/robot/base/cmd_vel',
-                                                  self.base_command, COMMAND_QOS)
-        self.lift_sub = node.create_subscription(TwistStamped, '/robot/lift/cmd_vel',
-                                                  self.lift_command, COMMAND_QOS)
+        self.pending_command = None
+        self.latest_command_ns = 0
+        self.teleop_fault = ''
+        self.command_sub = node.create_subscription(MobileCommand, '/robot/mobile/command',
+                                                    self.mobile_command, COMMAND_QOS)
         self.services = [
             node.create_service(Trigger, '/robot/chassis/' + name, callback)
             for name, callback in (('enable', self.enable), ('stop', self.stop), ('home_lift', self.home))
@@ -550,91 +578,84 @@ class ChassisRos:
 
     def check_feedback(self):
         c = self.control
-        if c.enabled and (c.last_feedback is None or c.clock() - c.last_feedback >= FEEDBACK_TIMEOUT_S):
+        if c.enabled and (c.last_feedback is None or c.clock() - c.last_feedback >= FEEDBACK_LOSS_GRACE_S):
             detail = (f'；上一总线操作 {getattr(self.node, "last_transaction_kind", "无")} '
                       f'{getattr(self.node, "last_transaction_duration_s", 0.):.3f}s，'
                       f'上一采样处理 {getattr(self.node, "last_feedback_cycle_duration_s", 0.):.3f}s')
             c.fail(c.feedback_timeout_reason() + detail)
             self.node.get_logger().error(c.reason)
 
-    def valid_command(self, message, allowed):
+    def valid_command(self, message):
+        received = self.control.clock()
         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
-        age = (self.node.get_clock().now().nanoseconds - stamp) * 1e-9
-        values = (message.twist.linear.x, message.twist.linear.y, message.twist.linear.z,
-                  message.twist.angular.x, message.twist.angular.y, message.twist.angular.z)
-        if (message.header.frame_id != 'base_link' or not 0 <= age <= .2
-                or not all(math.isfinite(v) for v in values)
-                or any(v != 0 for i, v in enumerate(values) if i not in allowed)):
-            raise ValueError('速度消息过期、坐标系错误或含不支持的分量')
+        expires = message.expires_at.sec * 1_000_000_000 + message.expires_at.nanosec
+        now = self.node.get_clock().now().nanoseconds
+        if (message.header.frame_id != 'base_link' or stamp <= 0 or stamp > now
+                or not 0 < expires - stamp <= round(COMMAND_VALIDITY_S * 1e9)):
+            raise ValueError('移动消息时间或坐标系无效')
+        if now >= expires:
+            raise CommandExpired('Mobile command expired in the ROS queue')
+        return received + (expires - now) / 1e9
 
-    def base_command(self, message):
+    def mobile_command(self, message):
+        if self.teleop_fault:
+            return
+        stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+        if 0 < stamp <= self.latest_command_ns:
+            return  # A prior command cannot undo a stop or supersede a newer target.
         try:
-            self.valid_command(message, (0, 1, 5))
-            for value, speed in zip(
-                    (message.twist.linear.x, message.twist.linear.y, message.twist.angular.z),
-                    MOBILE_ACTION_SCALE[1:]):
-                if min(abs(value - candidate) for candidate in (-speed, 0., speed)) > 1e-6:
-                    raise ValueError('底盘只接受 -1/0/+1 对应的固定速度')
-            if not self.control.enabled and not any((message.twist.linear.x, message.twist.linear.y,
-                                                     message.twist.angular.z)):
+            deadline = self.valid_command(message)
+            self.latest_command_ns = stamp
+            if not self.control.enabled and not any(message.commands):
                 return
-            if self.control.homing and not any((message.twist.linear.x, message.twist.linear.y,
-                                                message.twist.angular.z)):
-                return
-            self.control.set_base(message.twist.linear.x, message.twist.linear.y, message.twist.angular.z)
+            self.control.set_mobile(message.commands, deadline=deadline)
         except (OSError, ValueError, RuntimeError) as exc:
-            self.control.base = (0., 0., 0.)
+            self.pending_command = None
+            self.control.clear_target()
             self.control.reason = str(exc)
             return
-        self.record_velocity_request(message, 'base',
-                                     [message.twist.linear.x, message.twist.linear.y, message.twist.angular.z])
+        self.pending_command = message if not self.control.homing else None
 
-    def lift_command(self, message):
-        try:
-            self.valid_command(message, (2,))
-            speed = MOBILE_ACTION_SCALE[0]
-            if min(abs(message.twist.linear.z - candidate)
-                   for candidate in (-speed, 0., speed)) > 1e-6:
-                raise ValueError('升降只接受 -1/0/+1 对应的固定速度')
-            if not self.control.enabled and message.twist.linear.z == 0:
-                return
-            self.control.set_lift(message.twist.linear.z)
-        except (OSError, ValueError, RuntimeError) as exc:
-            self.control.lift_speed = 0.
-            self.control.reason = str(exc)
-            return
-        self.record_velocity_request(message, 'lift', [message.twist.linear.z])
-
-    def record_velocity_request(self, message, kind, values):
-        """Publish only complete new base/lift requests accepted by the driver."""
-        publisher = getattr(self, 'recording_command_publisher', None)
-        if publisher is None or not publisher.get_subscription_count():
+    def record_mobile_command(self):
+        """Acknowledge only after the shared controller has applied the command."""
+        message, self.pending_command = self.pending_command, None
+        if (message is None or self.control.fault or self.control.feedback_paused
+                or self.control.clock() >= self.control.mobile_until):
             return
         try:
+            self.valid_command(message)
             stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
-            self.recording_requests[kind] = (stamp, values)
-            base, lift = self.recording_requests.get('base'), self.recording_requests.get('lift')
-            if base is None or lift is None or base[0] != lift[0] or stamp <= self.last_recording_command_ns:
-                return
             event = {'kind': 'mobile', 'sequence': stamp, 'generated_ns': stamp, 'sent_ns': stamp,
                      'accepted_ns': self.node.get_clock().now().nanoseconds,
-                     'targets': [*lift[1], *base[1]], 'session': self.node.group_session_id}
-            publisher.publish(String(data=json.dumps(event, separators=(',', ':'), allow_nan=False)))
-            self.last_recording_command_ns = stamp
+                     'targets': [int(value) for value in message.commands], 'session': self.node.group_session_id}
+            self.recording_command_publisher.publish(String(data=json.dumps(event, separators=(',', ':'), allow_nan=False)))
         except Exception as exc:
             self.node.get_logger().warning(f'Recording velocity event unavailable: {exc}',
                                            throttle_duration_sec=1.)
+
+    def on_teleop_fault(self, message):
+        if self.teleop_fault or not message.data:
+            return
+        self.teleop_fault = message.data
+        response = self.stop(None, Trigger.Response())
+        if not response.success:
+            self.node.get_logger().error('遥操故障后零速度未确认：' + response.message)
 
     def enable(self, request, response):
         return self.service(self.control.enable, response)
 
     def stop(self, request, response):
-        return self.service(self.control.stop, response)
+        return self.service(self.control.stop, response, invalidate_commands=True, allow_fault=True)
 
     def home(self, request, response):
-        return self.service(self.control.begin_home, response)
+        return self.service(self.control.begin_home, response, invalidate_commands=True)
 
-    def service(self, operation, response):
+    def service(self, operation, response, *, invalidate_commands=False, allow_fault=False):
+        if self.teleop_fault and not allow_fault:
+            response.message = self.teleop_fault
+            return response
+        if invalidate_commands:
+            self.pending_command = None
         try:
             operation()
             response.success = True
@@ -643,6 +664,9 @@ class ChassisRos:
             response.message = (CHASSIS_NOT_READY if isinstance(exc, ChassisNotReady) else '') + str(exc)
             self.control.reason = '操作被拒绝：' + str(exc)
             self.node.get_logger().warning(self.control.reason)
+        finally:
+            if invalidate_commands:
+                self.latest_command_ns = max(self.latest_command_ns, self.node.get_clock().now().nanoseconds)
         return response
 
     def observe(self, message):
@@ -656,6 +680,7 @@ class ChassisRos:
         detail = '; '.join(f'ID {m.motor_id}: {m.error}' for m in message.motors
                            if m.motor_id in AXIS_IDS and m.motor_id not in samples and m.error)
         self.control.observe(samples, missing_detail=detail)
+        self.record_mobile_command()
         if self.control.fault and self.control.fault != previous_fault:
             self.node.get_logger().error(self.control.reason)
         # The measured-state topic is an observation output, not part of the
@@ -674,8 +699,8 @@ class ChassisRos:
             c = self.control
             speeds = [samples[i]['velocity_raw'] * math.tau / 4096 for i in (8, 9, 10) if i in samples]
             body = self.control.geometry.wheels_to_body(speeds) if len(speeds) == 3 else None
-            payload = {'enabled': c.enabled, 'fault': c.fault, 'reason': c.reason,
-                       'enable_ready': c.stationary_status()[0],
+            payload = {'enabled': c.enabled, 'fault': c.fault or self.teleop_fault, 'reason': c.reason,
+                       'enable_ready': not self.teleop_fault and c.stationary_status()[0],
                        'enable_wait_reason': c.stationary_status()[1],
                        'velocity_owned': sorted(c.driver.velocity_owned),
                        'feedback_paused': c.feedback_paused,
@@ -696,8 +721,8 @@ class ChassisRos:
         output.enabled = c.enabled
         output.homing = bool(c.homing)
         problems = []
-        if c.fault:
-            problems.append(c.fault)
+        if c.fault or self.teleop_fault:
+            problems.append(c.fault or self.teleop_fault)
         if c.feedback_paused:
             problems.append(c.reason or 'mobile feedback paused')
         missing = [motor_id for motor_id in AXIS_IDS if motor_id not in samples]
@@ -726,9 +751,9 @@ class ChassisRos:
         c = self.control
         samples = {m.motor_id: m for m in message.motors
                    if m.motor_id in AXIS_IDS and m.valid and not m.servo_error and not m.error}
-        if (not c.enabled or c.fault or c.feedback_paused or c.homing
+        if (not c.enabled or c.fault or self.teleop_fault or c.feedback_paused or c.homing
                 or c.height is None or len(samples) != 4):
-            return {'valid': False, 'reason': c.fault or c.reason}
+            return {'valid': False, 'reason': c.fault or self.teleop_fault or c.reason}
         measured = c.geometry.wheels_to_body([samples[i].velocity_raw * math.tau / 4096 for i in (8, 9, 10)])
         return {'valid': True, 'state': [c.height, *measured]}
 

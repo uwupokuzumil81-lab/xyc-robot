@@ -13,9 +13,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset
 
-from .checkpoint import json_write, load_checkpoint, save_checkpoint
-from .dataset import DatasetMetadata, EpisodeDataset
-from .registry import make_policy
+from .checkpoint import load_checkpoint, refresh_checkpoint_indexes, save_checkpoint
+from xyc.io import write_json
+from .dataset import EpisodeDataset
+from .dataset_metadata import DatasetMetadata
+from .registry import make_policy, policy_adapter
+from xyc.locking import acquire_file_lock
 
 
 class StepBatches(Sampler):
@@ -89,14 +92,16 @@ def train(config, *, resume=None, progress=print):
     root = Path(config.output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     lock = root / '.training.lock'
-    descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    os.write(descriptor, str(os.getpid()).encode())
-    os.close(descriptor)
+    try:
+        descriptor = acquire_file_lock(lock)
+    except OSError as exc:
+        raise FileExistsError('Another trainer owns this run: ' + str(root)) from exc
     dataset = validation = None
     try:
         if not resume and ((root / 'run.json').exists() or list(root.glob('checkpoint-*'))):
             raise FileExistsError('Run already exists: choose a new output_dir or explicitly resume it')
-        start, best_metric, saved_state = 0, math.inf, None
+        validation_spec = policy_adapter(config.policy).validation_spec()
+        start, best_metric, saved_state = 0, validation_spec.initial_best(), None
         if resume:
             adapter, manifest, saved_path = load_checkpoint(resume, device=device)
             validate_resume(config, manifest['train_config'])
@@ -104,18 +109,21 @@ def train(config, *, resume=None, progress=print):
                     or json.dumps(manifest['schema'], sort_keys=True) != json.dumps(metadata.schema.to_dict(), sort_keys=True)
                     or manifest['train_episodes'] != train_ids or manifest['validation_episodes'] != val_ids):
                 raise ValueError('Resume dataset, schema or episode split differs from the checkpoint')
+            if (manifest.get('validation_spec') is not None
+                    and manifest['validation_spec'] != validation_spec.to_dict()):
+                raise ValueError('Resume cannot change the validation definition')
+            refresh_checkpoint_indexes(root, validation_spec)
             # Only load optimizer/RNG pickle from this project's trusted training runs.
             saved_state = torch.load(saved_path / 'training.pt', map_location='cpu', weights_only=False)
             start, best_metric = manifest['step'], saved_state['best_metric']
         else:
-            statistics = metadata.statistics(train_ids)
+            factory = policy_adapter(config.policy)
+            statistics = metadata.statistics(train_ids, factory.statistics_spec(config.model, metadata.schema))
             adapter = make_policy(config.policy, model_config=config.model, schema=metadata.schema,
                                   statistics=statistics).to(device)
         if config.steps <= start:
             raise ValueError('Total steps must be greater than the checkpoint step')
-        model_options = adapter.config.to_dict()
-        for key in ('cameras', 'state_dim', 'action_dim'):
-            model_options.pop(key)
+        model_options = adapter.model_config()
         optimizer = torch.optim.AdamW(adapter.optimizer_groups(learning_rate=config.learning_rate,
                                      backbone_learning_rate=config.backbone_learning_rate),
                                      weight_decay=config.weight_decay)
@@ -138,9 +146,9 @@ def train(config, *, resume=None, progress=print):
                         state[key] = value.to(device)
             scheduler.load_state_dict(saved_state['scheduler'])
             restore_rng(saved_state['rng'])
-        common = dict(chunk_size=adapter.config.chunk_size, image_size=adapter.config.image_size)
-        dataset = EpisodeDataset(metadata, train_ids, **common)
-        validation = EpisodeDataset(metadata, val_ids, **common)
+        sample_spec = adapter.sample_spec(config.model, metadata.schema)
+        dataset = EpisodeDataset(metadata, train_ids, spec=sample_spec)
+        validation = EpisodeDataset(metadata, val_ids, spec=sample_spec)
         loader = DataLoader(dataset, batch_sampler=StepBatches(len(dataset), config.batch_size, start,
                                                              config.steps, config.seed),
                             num_workers=config.num_workers, worker_init_fn=worker_init,
@@ -153,15 +161,17 @@ def train(config, *, resume=None, progress=print):
                                 batch_size=config.batch_size, num_workers=0,
                                 generator=torch.Generator().manual_seed(config.seed + 1)) if val_ids else None
         base_manifest = {'policy': config.policy, 'model_config': model_options,
+                         'sample_spec': sample_spec.to_dict(), 'validation_spec': validation_spec.to_dict(),
+                         'statistics_spec': adapter.statistics_spec(config.model, metadata.schema).to_dict(),
                          'schema': metadata.schema.to_dict(), 'statistics': adapter.statistics,
                          'robot_assets': metadata.assets, 'dataset_fingerprint': fingerprint,
                          'train_episodes': train_ids, 'validation_episodes': val_ids,
                          'train_config': config.to_dict()}
-        json_write(root / 'run.json', base_manifest)
+        write_json(root / 'run.json', base_manifest)
         progress(f'Train {train_ids}, validation {val_ids}; {len(dataset)} frames; '
                  f'{sum(p.numel() for p in adapter.parameters()):,} parameters on {device}; steps {start}->{config.steps}')
         started, last_time = time.perf_counter(), time.perf_counter()
-        last_validation, checkpoint_path = None, None
+        last_validation, checkpoint_path, validation_values = None, None, {}
         with (root / 'metrics.jsonl').open('a', encoding='utf-8') as log:
             for step, batch in enumerate(loader, start=start + 1):
                 fetched = time.perf_counter()
@@ -183,17 +193,25 @@ def train(config, *, resume=None, progress=print):
                           'learning_rate': optimizer.param_groups[0]['lr'],
                           'data_seconds': fetched - last_time, 'compute_seconds': computed - fetched}
                 improved = False
+                step_validation = {}
                 if val_loader and (step % config.eval_every == 0 or step == config.steps):
-                    scores, weights = [], []
+                    totals, weights = {}, {}
                     for index, val_batch in enumerate(val_loader):
-                        scores.append(adapter.validation_metrics(val_batch)['action_l1_normalized'])
-                        weights.append(int((~val_batch['action_is_pad']).sum()))
+                        metrics = adapter.validation_metrics(val_batch)
+                        if validation_spec.primary not in metrics:
+                            raise ValueError('Adapter omitted its declared primary validation metric')
+                        for name, metric in metrics.items():
+                            totals[name] = totals.get(name, 0.) + metric.value * metric.weight
+                            weights[name] = weights.get(name, 0.) + metric.weight
                         if index + 1 >= config.eval_batches:
                             break
-                    last_validation = float(np.average(scores, weights=weights))
-                    record['validation_action_l1_normalized'] = last_validation
-                    improved = last_validation < best_metric
-                    best_metric = min(best_metric, last_validation)
+                    validation_values = {name: total / weights[name] for name, total in totals.items()}
+                    last_validation = validation_values[validation_spec.primary]
+                    step_validation = {'validation_' + name: value for name, value in validation_values.items()}
+                    record.update(step_validation)
+                    improved = validation_spec.improved(last_validation, best_metric)
+                    if improved:
+                        best_metric = last_validation
                 if step % config.log_every == 0 or step == start + 1 or step == config.steps:
                     log.write(json.dumps(record, allow_nan=False) + '\n')
                     log.flush()
@@ -202,17 +220,16 @@ def train(config, *, resume=None, progress=print):
                 if step % config.save_every == 0 or step == config.steps or improved:
                     state = {'step': step, 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                              'rng': rng_state(), 'best_metric': best_metric}
-                    checkpoint_path = save_checkpoint(root, adapter, {**base_manifest, 'step': step,
-                                      'validation_action_l1_normalized': last_validation}, state, best=improved)
+                    checkpoint_path = save_checkpoint(root, adapter, {**base_manifest, 'step': step, **step_validation}, state)
                 last_time = time.perf_counter()
         result = {'step': config.steps, 'checkpoint': str(checkpoint_path),
                   'elapsed_seconds': time.perf_counter() - started, 'last_loss': record['loss'],
-                  'validation_action_l1_normalized': last_validation}
-        json_write(root / 'result.json', result)
+                  **{'validation_' + name: value for name, value in validation_values.items()}}
+        write_json(root / 'result.json', result)
         return result
     finally:
         if dataset is not None:
             dataset.close()
         if validation is not None:
             validation.close()
-        lock.unlink(missing_ok=True)
+        os.close(descriptor)

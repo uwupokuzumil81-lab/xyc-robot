@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """PC operator logic runs without ROS or serial hardware on Windows."""
-import importlib.util
 import json
 import os
 import socket
-import sys
 import threading
 import time
 import types
@@ -13,14 +11,13 @@ import unittest
 from unittest.mock import patch
 from unittest.mock import MagicMock
 
-from xyc_hardware.teleop_transport import checked_chassis
+from xyc.transport.teleop import checked_chassis
 
 
-tool_override = os.environ.get('XYC_PC_TOOL')
-tool_path = Path(tool_override) if tool_override else Path(__file__).resolve().parents[4] / 'tools/teleop_stream.py'
-spec = importlib.util.spec_from_file_location('pc_teleop_stream', tool_path)
-pc = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pc)
+from xyc.teleop import cli as pc
+
+
+TEST_ROBOT_PROFILE = types.SimpleNamespace(ssh_host='test-robot.local', ssh_user='operator')
 
 
 def response(ack=None, enabled=True):
@@ -31,16 +28,11 @@ def response(ack=None, enabled=True):
 
 class TestPCKeyboard(unittest.TestCase):
     def test_slow_local_writer_initialization_finishes_before_control_connection(self):
-        fake = types.ModuleType('leader_arm')
-        fake.ROOT = Path(pc.__file__).resolve().parents[1]
-        fake.USB_SERIALS = {'left': 'fake-left', 'right': 'fake-right'}
-        fake.arm_names = lambda side: tuple(f'{side}_{i}' for i in range(7))
-        fake.identity = lambda settings: {}
-        fake.load_calibration = lambda *args: {}
-        fake.open_spec = lambda side: {'port': 'fake-' + side}
-        fake.require_torque_off = lambda settings: None
-        fake.LeaderCalibrationReader = MagicMock()
-        fake.LeaderCalibrationReader.return_value.settings.return_value = {}
+        leaders = MagicMock()
+        leaders.snapshot.return_value = types.SimpleNamespace(
+            sample_id=1, stamp_ns=time.monotonic_ns(), error='', notice='',
+            positions={'left': [0.] * 7, 'right': [0.] * 7},
+            calibration_ids={'left': 'a' * 64, 'right': 'b' * 64})
         events, replies, errors = [], [], []
         local = MagicMock()
         def prepare(_directory):
@@ -65,10 +57,11 @@ class TestPCKeyboard(unittest.TestCase):
             worker.start()
             args = types.SimpleNamespace(record=True, record_config={'dataset': 'xyc/test', 'task': 'test'},
                                          side='both', keyboard=False, monitor=False, preview=False)
-            with patch.dict(sys.modules, {'leader_arm': fake}), patch.object(pc, 'PORT', listener.getsockname()[1]), \
+            with patch.object(pc, 'LeaderArms', return_value=leaders), patch.object(pc, 'PORT', listener.getsockname()[1]), \
+                    patch.object(pc, 'robot_profile', return_value=TEST_ROBOT_PROFILE), \
                     patch.object(pc, 'SSHDataTunnel') as tunnel, \
                     patch.object(pc.RecordingRemote, 'start_local', side_effect=prepare), \
-                    patch.object(pc, 'leader_stream_sample', side_effect=lambda *a, **kw: ([0.] * 7, time.monotonic_ns(), [])):
+                    patch.object(pc, 'MAX_SAMPLE_AGE', 10.):
                 with self.assertRaises(EOFError):
                     pc.run_leader(args)
             worker.join(3.)
@@ -77,7 +70,7 @@ class TestPCKeyboard(unittest.TestCase):
         self.assertEqual(replies[0]['sequence'], 1)
         self.assertEqual(set(replies[0]['positions']), {'left', 'right'})
         local.close.assert_called_once()
-        tunnel.assert_called_once_with('raspberrypi.local', 'pi5')
+        tunnel.assert_called_once_with('test-robot.local', 'operator')
 
     def test_preview_and_recording_use_a_separate_owned_ssh_connection(self):
         process = MagicMock()
@@ -112,6 +105,7 @@ class TestPCKeyboard(unittest.TestCase):
         with patch.object(pc.sys, 'argv', ['teleop_stream.py', 'leader', '--side', 'both',
                                          '--record', '--dataset', 'xyc/test', '--task', '拿起玩具',
                                          '--episode-seconds', '10', '--fps', '30', '--episodes', '5']), \
+                patch.object(pc, 'robot_profile', return_value=TEST_ROBOT_PROFILE), \
                 patch.object(pc, 'run_leader') as run:
             self.assertEqual(pc.main(), 0)
             args = run.call_args.args[0]
@@ -119,9 +113,9 @@ class TestPCKeyboard(unittest.TestCase):
             self.assertEqual(args.record_config['episode_frames'], 300)
             self.assertEqual(args.record_config['scope'], 'mobile')
             self.assertEqual(args.record_config['num_episodes'], 5)
-            self.assertEqual(args.data_dir, Path(pc.__file__).resolve().parents[1] / 'data' / 'datasets')
-            self.assertEqual(args.robot_host, 'raspberrypi.local')
-            self.assertEqual(args.robot_user, 'pi5')
+            self.assertEqual(args.data_dir, pc.project_root() / 'data' / 'datasets')
+            self.assertEqual(args.robot_host, 'test-robot.local')
+            self.assertEqual(args.robot_user, 'operator')
 
     def test_local_recording_waits_for_matching_backend_and_data_channel(self):
         from types import SimpleNamespace
@@ -160,8 +154,7 @@ class TestPCKeyboard(unittest.TestCase):
         recorder.receive({'recording_supported': True, 'recording_ack': {'id': 2, 'accepted': True}})
         keyboard.handle_key('N')
         self.assertEqual(recorder.command()['operation'], 'discard')
-        self.assertEqual(keyboard.base, (0., 0., 0.))
-        self.assertEqual(keyboard.lift, 0.)
+        self.assertEqual(keyboard.mobile.values(), [0.] * 4)
 
     def test_home_cannot_interrupt_an_open_or_starting_recording(self):
         for phase in ('waiting', 'recording', 'saving'):
@@ -251,11 +244,11 @@ class TestPCKeyboard(unittest.TestCase):
         keyboard = pc.LocalChassisKeyboard()
         keyboard.receive(response(enabled=False), 1.)
         keyboard.handle_key('w', 1.)
-        self.assertEqual(keyboard.command(1.01)['base'], [0., 0., 0.])
+        self.assertEqual(keyboard.command(1.01)['commands'][1:], [0., 0., 0.])
         self.assertEqual(keyboard.command(1.03)['operation'], {'id': 1, 'name': 'enable'})
         keyboard.receive(response({'id': 1, 'accepted': True}), 1.04)
         keyboard.handle_key('w', 1.05)
-        self.assertEqual(keyboard.command(1.06)['base'], [.15, 0., 0.])
+        self.assertEqual(keyboard.command(1.06)['commands'], [0., 1., 0., 0.])
         keyboard.handle_key('e', 1.07)
         self.assertIsNone(keyboard.command(1.08)['operation'])
 
@@ -263,7 +256,7 @@ class TestPCKeyboard(unittest.TestCase):
         keyboard = pc.LocalChassisKeyboard()
         keyboard.receive(response(), 1.)
         keyboard.handle_key('W', 1.01)
-        self.assertEqual(keyboard.command(1.02)['base'], [.15, 0., 0.])
+        self.assertEqual(keyboard.command(1.02)['commands'], [0., 1., 0., 0.])
 
     def test_pending_ack_keeps_automatic_enable_and_failure_survives_voltage_notice(self):
         keyboard = pc.LocalChassisKeyboard()
@@ -289,11 +282,11 @@ class TestPCKeyboard(unittest.TestCase):
         keyboard = self.ready_keyboard()
         keyboard.handle_key('w', 1.01)
         keyboard.handle_key('i', 1.01)
-        self.assertEqual(keyboard.command(1.02)['lift_m_s'], .015)
-        self.assertEqual(keyboard.command(1.27)['base'], [0., 0., 0.])
-        self.assertEqual(keyboard.command(1.27)['lift_m_s'], 0.)
+        self.assertEqual(keyboard.command(1.02)['commands'][0], 1.)
+        self.assertEqual(keyboard.command(1.27)['commands'][1:], [0., 0., 0.])
+        self.assertEqual(keyboard.command(1.27)['commands'][0], 0.)
         keyboard.handle_key('w', 1.6)
-        self.assertEqual(keyboard.command(1.61)['base'], [0., 0., 0.])
+        self.assertEqual(keyboard.command(1.61)['commands'][1:], [0., 0., 0.])
 
     def test_homing_keeps_packets_live_but_ignores_direction_keys(self):
         keyboard = self.ready_keyboard()
@@ -305,12 +298,12 @@ class TestPCKeyboard(unittest.TestCase):
                 state['chassis_status']['homing'] = phase
                 keyboard.receive(state, 1.02)
                 keyboard.handle_key('K', 1.03)
-                self.assertEqual(keyboard.command(1.04)['base'], [0., 0., 0.])
-                self.assertEqual(keyboard.command(1.04)['lift_m_s'], 0.)
+                self.assertEqual(keyboard.command(1.04)['commands'][1:], [0., 0., 0.])
+                self.assertEqual(keyboard.command(1.04)['commands'][0], 0.)
                 self.assertIn('等待完成', keyboard.notice)
         keyboard.receive(response(), 1.1)
         keyboard.handle_key('I', 1.11)
-        self.assertEqual(keyboard.command(1.12)['lift_m_s'], .015)
+        self.assertEqual(keyboard.command(1.12)['commands'][0], 1.)
 
     def test_space_overrides_pending_home_and_old_ack_cannot_clear_new_stop(self):
         keyboard = self.ready_keyboard()
@@ -335,13 +328,13 @@ class TestPCKeyboard(unittest.TestCase):
         keyboard = pc.LocalChassisKeyboard()
         with self.assertRaisesRegex(ValueError, 'chassis_mode'):
             keyboard.receive({}, 1.)
-        for payload in ({'base': [1, 0, 0], 'lift_m_s': 0},
-                        {'base': [.1, 0, 0], 'lift_m_s': 0},
-                        {'base': [0, 0, 0], 'lift_m_s': float('nan')},
-                        {'base': [0, 0, 0], 'lift_m_s': 0, 'operation': {'id': True, 'name': 'enable'}}):
+        for payload in ({'commands': [0, 2, 0, 0]},
+                        {'base': [.15, 0, 0], 'lift_m_s': 0},
+                        {'commands': [float('nan'), 0, 0, 0]},
+                        {'commands': [0, 0, 0, 0], 'operation': {'id': True, 'name': 'enable'}}):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 checked_chassis(payload)
-        self.assertEqual(checked_chassis(keyboard.command(1.))[0], (0., 0., 0.))
+        self.assertEqual(checked_chassis(keyboard.command(1.))[0], [0., 0., 0., 0.])
 
     @unittest.skipUnless(pc.sys.platform == 'linux', 'Linux terminal test')
     def test_linux_terminal_reads_keys_and_restores_attributes(self):
@@ -377,3 +370,62 @@ class TestPCKeyboard(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPortableCalibration(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Linux terminal pseudo-device')
+    def test_shared_terminal_reads_keys_and_restores_linux_settings(self):
+        import pty
+        import termios
+        from xyc.terminal import TerminalKeys
+        master, slave = pty.openpty()
+        try:
+            with os.fdopen(os.dup(slave), 'r') as stream:
+                before = termios.tcgetattr(slave)
+                with TerminalKeys(stream) as keys:
+                    os.write(master, b'W\x1b[D\r')
+                    received = []
+                    deadline = time.monotonic() + 1.
+                    while not received and time.monotonic() < deadline:
+                        received = keys.read()
+                        time.sleep(.001)
+                    self.assertEqual(received, ['w', '\n'])
+                self.assertEqual(termios.tcgetattr(slave), before)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_linux_calibration_uses_shared_keys_and_saves_all_seven_ranges(self):
+        import tempfile
+        from xyc.teleop import calibrate as module
+        names = module.arm_names('right')
+        settings = {name: {'torque_enabled': 0, 'model': 777} for name in names}
+        reference = dict.fromkeys(names, 2000)
+        rows = {name: ('2000', '5.0', 'OK') for name in names}
+        keys = MagicMock()
+        keys.__enter__.return_value = keys
+        keys.read.side_effect = [[], ['\n']]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'right.json'
+            with patch.object(module.sys.stdin, 'isatty', return_value=True), \
+                    patch.object(module, 'TerminalKeys', return_value=keys), \
+                    patch.object(module, 'TerminalTable'), \
+                    patch.object(module, 'stable_reference', return_value=reference), \
+                    patch.object(module, 'calibration_sample', side_effect=[
+                        (dict.fromkeys(names, 1800), rows), (dict.fromkeys(names, 2200), rows)]), \
+                    patch('builtins.input', side_effect=['', 'save']):
+                module.calibrate(types.SimpleNamespace(settings=lambda: settings), 'right', settings, path, False)
+            result = json.loads(path.read_text())
+            self.assertEqual(set(result['ranges']), set(names))
+            self.assertTrue(all(entry['max_delta_ticks'] - entry['min_delta_ticks'] == 400
+                                for entry in result['ranges'].values()))
+
+
+class TestConsoleInterrupt(unittest.TestCase):
+    def test_shared_key_interrupt_requests_stop_instead_of_only_ending_ui_thread(self):
+        keyboard = pc.LocalChassisKeyboard()
+        with patch.object(pc, 'ConsoleKeys'), patch.object(
+                keyboard, '_console_loop', side_effect=KeyboardInterrupt):
+            keyboard.run_console(threading.Event())
+        self.assertEqual(keyboard.operation['name'], 'stop')
+        self.assertIsNotNone(keyboard.quit_at)

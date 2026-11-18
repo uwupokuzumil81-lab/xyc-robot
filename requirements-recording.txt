@@ -1,6 +1,2 @@
-# Desktop dataset writer on Windows/Linux; no ROS or training stack required.
-numpy>=1.26,<3
-opencv-python>=4.9,<5
-pyarrow>=17,<24
-av>=14,<17
-pandas>=2.2,<3
+# Desktop LeRobot writer; use from the project root.
+-e .[recording]

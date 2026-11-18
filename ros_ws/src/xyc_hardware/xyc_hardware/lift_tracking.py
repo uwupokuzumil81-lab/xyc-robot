@@ -101,11 +101,3 @@ class LiftTracker:
         # Keep the complete encoder delta above, so jitter cannot ratchet the
         # reference. Only the reported height saturates within the allowance.
         return min(self.geometry.max_height_m, max(self.geometry.min_height_m, height))
-
-    def height_to_delta_ticks(self, height_m):
-        if not self.valid:
-            raise ValueError('Reference is invalid; establish a new reference')
-        height = _number(height_m, 'height_m')
-        if not self.geometry.min_height_m <= height <= self.geometry.max_height_m:
-            raise ValueError('Target height is outside verified limits')
-        return round(self.geometry.direction * height * PERIOD / self.geometry.lead_m_per_revolution)

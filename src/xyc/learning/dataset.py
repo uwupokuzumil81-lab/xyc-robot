@@ -5,14 +5,14 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .contracts import ACTION, OBS_STATE
-from .dataset_metadata import DatasetMetadata, Episode, RGBVideos
+from xyc.contracts import ACTION, OBS_STATE
+from .dataset_metadata import RGBVideos
 
 
 class EpisodeDataset(Dataset):
-    def __init__(self, metadata, episodes, *, chunk_size, image_size):
+    def __init__(self, metadata, episodes, *, spec):
         self.metadata, self.episodes = metadata, list(episodes)
-        self.chunk_size, self.image_size = int(chunk_size), tuple(image_size)
+        self.spec = spec
         self.ends = np.cumsum([metadata.episodes[i].length for i in self.episodes]).tolist()
         self.reader = None
 
@@ -29,16 +29,35 @@ class EpisodeDataset(Dataset):
         episode, frame = self.locate(int(index))
         numeric = self.metadata.numeric(episode)
         length = len(numeric[ACTION])
-        indices = np.minimum(np.arange(frame, frame + self.chunk_size), length - 1)
-        result = {OBS_STATE: torch.from_numpy(numeric[OBS_STATE][frame].copy()),
-                  ACTION: torch.from_numpy(numeric[ACTION][indices].copy()),
-                  'action_is_pad': torch.arange(frame, frame + self.chunk_size) >= length}
+        def indices(offsets):
+            requested = frame + np.asarray(offsets)
+            return np.clip(requested, 0, length - 1), torch.from_numpy((requested < 0) | (requested >= length))
+
+        action_indices, padding = indices(self.spec.action_offsets)
+        result = {ACTION: torch.from_numpy(numeric[ACTION][action_indices].copy()), 'action_is_pad': padding}
+        if self.spec.state_offsets is None:
+            result[OBS_STATE] = torch.from_numpy(numeric[OBS_STATE][frame].copy())
+        else:
+            state_indices, padding = indices(self.spec.state_offsets)
+            result[OBS_STATE] = torch.from_numpy(numeric[OBS_STATE][state_indices].copy())
+            result[OBS_STATE + '_is_pad'] = padding
+            result['observation.current_state'] = torch.from_numpy(numeric[OBS_STATE][frame].copy())
         if self.reader is None:
-            self.reader = RGBVideos(self.image_size)
+            self.reader = RGBVideos()
+        image_indices, padding = indices(self.spec.image_offsets or (0,))
         for camera in self.metadata.cameras:
             path, offset = self.metadata.video(episode, camera)
-            image = self.reader.read(path, offset + frame / self.metadata.schema.fps, self.metadata.schema.fps)
-            result['observation.images.' + camera] = torch.from_numpy(image).permute(2, 0, 1).contiguous()
+            images = [torch.from_numpy(self.reader.read(
+                path, offset + int(i) / self.metadata.schema.fps, self.metadata.schema.fps))
+                .permute(2, 0, 1).contiguous() for i in image_indices]
+            key = 'observation.images.' + camera
+            result[key] = images[0] if self.spec.image_offsets is None else torch.stack(images)
+            if self.spec.image_offsets is not None:
+                result[key + '_is_pad'] = padding
+                current = self.reader.read(path, offset + frame / self.metadata.schema.fps, self.metadata.schema.fps)
+                result['observation.current_images.' + camera] = torch.from_numpy(current).permute(2, 0, 1).contiguous()
+        if self.spec.include_task:
+            result['task'] = self.metadata.task_text(episode, frame)
         return result
 
     def __getstate__(self):

@@ -1,12 +1,14 @@
 """Checkpoint-based action prediction; no serial, ROS or motor writes."""
 
-import json
 from pathlib import Path
+from torch.utils.data import default_collate
 
-from .checkpoint import json_write, load_checkpoint
-from .config import project_root
-from .contracts import ACTION_NAMES, OBS_STATE, robot_action
-from .dataset import DatasetMetadata, EpisodeDataset
+from .checkpoint import load_checkpoint
+from xyc.io import write_json
+from xyc.paths import project_root
+from xyc.contracts import ACTION_NAMES, robot_action
+from .dataset_metadata import DatasetMetadata
+from .dataset import EpisodeDataset
 from xyc.runtime.policy_runner import PolicyRunner
 
 
@@ -18,16 +20,15 @@ def validate_inputs(adapter, manifest, metadata):
 
 
 def predict_dataset(checkpoint, dataset, *, episode=0, frame=0, device='cpu', output=None,
-                    frames=1, record=True, record_dir=None, record_video=False):
+                    frames=1, record=True, record_dir=None, record_video=False, checkpoint_selection='latest'):
     if type(frames) is not int or frames < 1 or frame < 0:
         raise ValueError('frames must be positive and frame must be non-negative')
     if not record and (record_dir is not None or record_video):
         raise ValueError('Recording directory/video cannot be combined with record=False')
-    adapter, manifest, path = load_checkpoint(checkpoint, device=device)
+    adapter, manifest, path = load_checkpoint(checkpoint, device=device, selection=checkpoint_selection)
     metadata = DatasetMetadata(dataset, adapter.schema.cameras)
     validate_inputs(adapter, manifest, metadata)
-    data = EpisodeDataset(metadata, [episode], chunk_size=adapter.config.chunk_size,
-                          image_size=adapter.config.image_size)
+    data = EpisodeDataset(metadata, [episode], spec=adapter.sample_spec(manifest['model_config'], metadata.schema))
     if frame + frames > len(data):
         raise ValueError('Offline replay cannot cross the end of its episode')
     recorder = None
@@ -55,7 +56,7 @@ def predict_dataset(checkpoint, dataset, *, episode=0, frame=0, device='cpu', ou
         first_prediction = None
         for index in range(frame, frame + frames):
             sample = data[index]
-            batch = {key: value.unsqueeze(0) for key, value in sample.items()}
+            batch = default_collate([sample])
             runner.step(batch, observation={'episode': episode, 'frame': index,
                         'source_time_ns': round(index / adapter.schema.fps * 1e9),
                         'source_clock': 'dataset_nominal_video_time'})
@@ -70,13 +71,13 @@ def predict_dataset(checkpoint, dataset, *, episode=0, frame=0, device='cpu', ou
                   'actions_scope': 'first_prediction_chunk',
                   'record_dir': str(recorder.path) if recorder is not None else None}
         if adapter.schema.action_names == ACTION_NAMES:
-            result['first_robot_action'] = robot_action(actions[0], adapter.schema)
+            result['first_robot_action'] = robot_action(actions[0], adapter.schema, bound_arms=True)
         if recorder is not None:
             result['record_status'] = recorder.close()['status']
         if output:
             output = Path(output).expanduser().resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
-            json_write(output, result)
+            write_json(output, result)
         return result
     except BaseException as exc:
         error = exc

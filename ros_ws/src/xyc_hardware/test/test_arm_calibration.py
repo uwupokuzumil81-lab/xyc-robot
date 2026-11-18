@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from xyc_hardware.arm_calibration import (
+from xyc.robot.calibration import (
     CalibrationReader, RangeRecorder, arm_names, check_hardware, denormalize_tick,
     import_legacy, main, normalize_tick, save_document, validate_document,
 )
@@ -116,7 +116,7 @@ class TestCalibrationTransport(unittest.TestCase):
         spec, _, _ = fixture()
         serial = MagicMock()
         serial.write.side_effect = len
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
             reader = CalibrationReader(spec, allow_release=allow_release)
         return reader, serial
 
@@ -176,7 +176,7 @@ class TestCalibrationPersistence(unittest.TestCase):
             path = Path(directory) / 'left.json'
             save_document(path, document)
             original = path.read_bytes()
-            with patch('xyc_hardware.arm_calibration.os.replace', side_effect=OSError('disk fault')):
+            with patch('xyc.robot.calibration.os.replace', side_effect=OSError('disk fault')):
                 with self.assertRaises(OSError):
                     save_document(path, document)
             self.assertEqual(path.read_bytes(), original)
@@ -184,7 +184,7 @@ class TestCalibrationPersistence(unittest.TestCase):
 
     def test_recording_requires_an_interactive_terminal_before_opening_port(self):
         with patch('sys.stdin.isatty', return_value=False), \
-             patch('xyc_hardware.arm_calibration.CalibrationReader') as reader:
+             patch('xyc.robot.calibration.CalibrationReader') as reader:
             with self.assertRaises(SystemExit) as result:
                 main(['--arm', 'left', '--record'])
         self.assertEqual(result.exception.code, 1)

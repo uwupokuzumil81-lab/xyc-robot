@@ -5,13 +5,16 @@ import json
 import threading
 import time
 
-from geometry_msgs.msg import TwistStamped
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from xyc_interfaces.msg import MobileCommand
 
-from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS
-from xyc_hardware.teleop_transport import checked_chassis
+from xyc_hardware.chassis_control import (
+    CHASSIS_NOT_READY, COMMAND_QOS, TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC, mobile_message,
+)
+from xyc.contracts import COMMAND_VALIDITY_S
+from xyc.transport.teleop import MAX_SAMPLE_AGE, checked_chassis
 
 
 class PCChassisBridge(Node):
@@ -27,19 +30,20 @@ class PCChassisBridge(Node):
         self.last_received_operation = 0
         self.operation_deadline = 0.
         self.ack = None
+        self.teleop_fault = ''
         self.stop_needed = False
         self._zero_sent = False
         super().__init__('pc_chassis_bridge', use_global_arguments=False)
-        self.base_pub = self.create_publisher(TwistStamped, '/robot/base/cmd_vel', COMMAND_QOS)
-        self.lift_pub = self.create_publisher(TwistStamped, '/robot/lift/cmd_vel', COMMAND_QOS)
+        self.mobile_pub = self.create_publisher(MobileCommand, '/robot/mobile/command', COMMAND_QOS)
         self.status_sub = self.create_subscription(String, '/robot/chassis/status', self.on_status, 1)
+        self.fault_sub = self.create_subscription(String, TELEOP_FAULT_TOPIC, self.on_teleop_fault, TELEOP_FAULT_QOS)
         self.control_clients = {name: self.create_client(Trigger, '/robot/chassis/' + name)
                                 for name in ('enable', 'stop', 'home_lift')}
         self.pending = None
         self.state = {}
         self.received = None
-        self.base, self.lift = (0., 0., 0.), 0.
-        self.base_until = self.lift_until = 0.
+        self.commands = [0.] * 4
+        self.command_until = 0.
         self.timer = self.create_timer(1 / 30, self.publish_commands)
 
     def on_status(self, message):
@@ -51,23 +55,26 @@ class PCChassisBridge(Node):
         except (TypeError, ValueError):
             return
 
+    def on_teleop_fault(self, message):
+        with self.packet_lock:
+            if self.teleop_fault or not message.data:
+                return
+            self.teleop_fault = message.data
+            self.packet = None
+            self.ack = None
+
     def publish_velocity(self):
+        stamp = self.get_clock().now().to_msg()
         now = time.monotonic()
         # A delayed key stream never keeps a previous velocity alive.
-        base = self.base if now < self.base_until else (0., 0., 0.)
-        lift = self.lift if now < self.lift_until else 0.
+        commands = self.commands if now < self.command_until else [0.] * 4
         if (self.received is None or now - self.received > .5
                 or not self.state.get('enabled')):
-            base, lift = (0., 0., 0.), 0.
-        stamp = self.get_clock().now().to_msg()
-        command = TwistStamped()
-        command.header.stamp, command.header.frame_id = stamp, 'base_link'
-        command.twist.linear.x, command.twist.linear.y, command.twist.angular.z = base
-        self.base_pub.publish(command)
-        command = TwistStamped()
-        command.header.stamp, command.header.frame_id = stamp, 'base_link'
-        command.twist.linear.z = lift
-        self.lift_pub.publish(command)
+            commands = [0.] * 4
+        generated = stamp.sec * 10**9 + stamp.nanosec
+        lifetime = min(COMMAND_VALIDITY_S, self.command_until - now) if any(commands) else COMMAND_VALIDITY_S
+        self.mobile_pub.publish(mobile_message(
+            self, commands, stamp=stamp, expires_ns=generated + int(lifetime * 1e9)))
 
     def begin_session(self, session):
         with self.packet_lock:
@@ -78,17 +85,21 @@ class PCChassisBridge(Node):
             self.ack = None
 
     def receive_packet(self, session, payload):
-        base, lift, operation = checked_chassis(payload)
+        commands, operation = checked_chassis(payload)
         with self.packet_lock:
             if session != self.session:
                 raise ValueError('底盘控制连接已变化')
+            if self.teleop_fault:
+                if operation is not None:
+                    self.ack = {'id': operation['id'], 'accepted': False, 'message': self.teleop_fault[:80]}
+                return
             if operation is not None:
                 if operation['id'] < self.last_received_operation:
                     raise ValueError('底盘操作序号倒退')
                 if operation['id'] > self.last_received_operation:
                     self.operation_deadline = time.monotonic() + 3.
                 self.last_received_operation = operation['id']
-            self.packet = (time.monotonic(), base, lift, operation)
+            self.packet = (time.monotonic(), commands, operation)
 
     def disconnect(self, session):
         with self.packet_lock:
@@ -101,6 +112,8 @@ class PCChassisBridge(Node):
         with self.packet_lock:
             fresh = self.received is not None and time.monotonic() - self.received <= .5
             status = dict(self.state) if fresh else {}
+            if self.teleop_fault:
+                status['fault'] = self.teleop_fault
             for field in ('fault', 'reason'):
                 if field in status:
                     status[field] = str(status[field])[:80]
@@ -110,6 +123,8 @@ class PCChassisBridge(Node):
     def publish_commands(self):
         now = time.monotonic()
         with self.packet_lock:
+            if self.teleop_fault:
+                return  # The motor owner executes the same stop operation used by replay and policy.
             if self.operation is not None:
                 session, operation_id, name = self.operation
                 if self.pending.done():
@@ -138,13 +153,12 @@ class PCChassisBridge(Node):
                     self.stop_needed = True
                     self.packet = None
             packet = self.packet
-            active = packet is not None and 0 <= now - packet[0] <= .15
+            active = packet is not None and 0 <= now - packet[0] <= MAX_SAMPLE_AGE
             if packet is not None and not active:
                 self.packet = None
                 self.stop_needed = True
-            self.base, self.lift = (packet[1], packet[2]) if active else ((0., 0., 0.), 0.)
-            self.base_until = self.lift_until = now + .05 if active else 0.
-            requested = packet[3] if active else None
+            self.command_until = min(now + .05, packet[0] + MAX_SAMPLE_AGE) if active else 0.
+            requested = packet[2] if active else None
             if self.operation is None:
                 if self.stop_needed:
                     operation_id, name, session = 0, 'stop', self.session
@@ -169,12 +183,15 @@ class PCChassisBridge(Node):
                             self.last_operation_id = operation_id
                             self.ack = {'id': operation_id, 'accepted': False,
                                         'message': '底盘服务未就绪，请用 chassis_mode:=true 启动'}
+            stopping = self.stop_needed or (self.operation is not None and self.operation[2] == 'stop')
+            stopping |= requested is not None and requested['name'] == 'stop'
+            self.commands = packet[1] if active and not stopping else [0.] * 4
             # No heartbeat after disconnection: an in-flight homing request
             # also loses its lease if its stop response is unavailable.
             if active:
                 self.publish_velocity()
             elif self.stop_needed or self.operation is not None:
-                self.base_until = self.lift_until = 0.
+                self.command_until = 0.
                 # The stop service cancels homing. Publish zero once while
                 # waiting; repeated zero heartbeats would keep homing alive.
                 if not self._zero_sent:

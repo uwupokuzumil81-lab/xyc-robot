@@ -5,8 +5,9 @@
   "upstream_sha256": "69301fff11cbb8f4ba7bfe473a55ba488c3d2f89c25ecdfe512347a93b4ad04f",
   "license": "Apache-2.0",
   "changes": [
-    "Use local ACTConfig and platform constants",
+    "Use local ACTConfig and xyc.contracts",
     "Replace PreTrainedPolicy with torch.nn.Module; platform owns serialization",
-    "Network forward, loss, transformer and temporal ensemble mathematics unchanged"
+    "Network forward, loss, transformer and temporal ensemble mathematics unchanged",
+    "Remove unused select_action and its private queue; platform runtime owns action scheduling"
   ]
 }

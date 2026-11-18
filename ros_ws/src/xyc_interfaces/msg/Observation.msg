@@ -1,5 +1,6 @@
-# One validated LIVE observation. Images are preserved, not resized or compressed.
-# header.stamp is the forward-camera timestamp, NOT publication time.
+# One validated LIVE observation from the common ObservationBuffer.
+# Images are decoded from the same JPEGs used by recording and inference.
+# header.stamp is the median camera read-completion time, NOT publication time.
 # Camera sampling is approximate; these fields do not imply hardware sync.
 std_msgs/Header header
 builtin_interfaces/Time published_at

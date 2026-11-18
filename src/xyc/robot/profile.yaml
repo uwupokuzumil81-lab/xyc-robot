@@ -1,0 +1,123 @@
+connection:
+  host: raspberrypi.local
+  user: pi5
+ports:
+  teleop: 17882
+  data: 17883
+  motion: 17886
+  recording: 17884
+project_directory: pi05_from_zero
+leaders:
+  left: 5B79017577
+  right: 5B79018606
+buses:
+  left:
+    port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B8E116280-if00
+    baudrate: 1000000
+    motor_ids:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    motor_names:
+    - arm_left_shoulder_pan
+    - arm_left_shoulder_lift
+    - arm_left_elbow_flex
+    - arm_left_wrist_flex
+    - arm_left_wrist_yaw
+    - arm_left_wrist_roll
+    - arm_left_gripper
+    - base_left_wheel
+    - base_back_wheel
+    - base_right_wheel
+    - lift_axis
+    model_numbers:
+    - 2825
+    - 2569
+    - 2569
+    - 2825
+    - 2825
+    - 2825
+    - 2825
+    - 2825
+    - 2825
+    - 2825
+    - 2569
+  right:
+    port: /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79015598-if00
+    baudrate: 1000000
+    motor_ids:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    motor_names:
+    - arm_right_shoulder_pan
+    - arm_right_shoulder_lift
+    - arm_right_elbow_flex
+    - arm_right_wrist_flex
+    - arm_right_wrist_yaw
+    - arm_right_wrist_roll
+    - arm_right_gripper
+    model_numbers:
+    - 2825
+    - 2569
+    - 2569
+    - 2825
+    - 2825
+    - 2825
+    - 2825
+cameras:
+  forward:
+    device: /dev/v4l/by-id/usb-am_camera_forward_am_camera_forward_am_camera_forward-video-index0
+    frame_id: camera_forward_optical_frame
+    width: 640
+    height: 480
+    fps: 30.0
+    jpeg_quality: 75
+  chest:
+    device: /dev/v4l/by-id/usb-am_camera_chest_am_camera_chest_am_camera_chest-video-index0
+    frame_id: camera_chest_optical_frame
+    width: 640
+    height: 480
+    fps: 30.0
+    jpeg_quality: 75
+  wrist_left:
+    device: /dev/v4l/by-id/usb-am_camera_wrist_left_am_camera_wrist_left_am_camera_wrist_left-video-index0
+    frame_id: camera_wrist_left_optical_frame
+    width: 640
+    height: 480
+    fps: 30.0
+    jpeg_quality: 75
+  wrist_right:
+    device: /dev/v4l/by-id/usb-am_camera_wrist_right_am_camera_wrist_right_am_camera_wrist_right-video-index0
+    frame_id: camera_wrist_right_optical_frame
+    width: 640
+    height: 480
+    fps: 30.0
+    jpeg_quality: 75
+geometry:
+  wheel_radius_m: 0.063
+  base_radius_m: 0.195
+  wheel_angles_deg:
+  - 150.0
+  - -90.0
+  - 30.0
+  wheel_signs:
+  - 1
+  - 1
+  - 1
+  lift_lead_m_per_revolution: 0.131
+  lift_direction: -1
+  lift_max_height_m: 0.6
+preview_fps: 15.0

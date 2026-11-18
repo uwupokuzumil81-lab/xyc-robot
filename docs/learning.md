@@ -9,17 +9,25 @@
 
 | 环节 | 平台公共代码 | ACT 专用代码 |
 | --- | --- | --- |
-| 读取数据 | learning/dataset.py：v3索引、视频解码、回合划分、动作窗口 | 通过模型配置指定图像尺寸、窗口长度 |
+| 读取数据 | learning/dataset.py：按声明读取v3索引、视频、任务文本和时间窗口 | `sample_spec()`声明state/图像历史、动作偏移与任务文本需求；适配器处理图像尺寸 |
+| 统计与归一化 | DatasetMetadata按声明只计算训练回合的统计量 | `statistics_spec()`声明mean/std或分位数等；适配器执行归一化和反归一化 |
 | 配置 | learning/config.py：路径、训练步数、优化器、保存频率 | models/act/configuration_act.py：ACT网络、VAE、chunk参数 |
-| 输入输出 | learning/contracts.py：相机名、状态/动作顺序、单位 | models/act/adapter.py：图像归一化、张量打包、反归一化 |
-| 训练 | learning/trainer.py：优化、验证、日志、续训 | ACT提供loss和参数组，网络代码在modeling_act.py |
+| 输入输出 | contracts.py：相机名、状态/动作顺序、单位 | models/act/adapter.py：图像缩放与归一化、张量打包、反归一化 |
+| 训练 | learning/trainer.py：优化、验证、日志、续训 | 适配器提供loss、参数组、验证指标与权重，网络代码在modeling_act.py |
 | 保存恢复 | learning/checkpoint.py：权重、资产、配置、统计量、训练状态 | 无另一套LeRobot保存/恢复接口 |
 | 推理 | runtime/：逐帧执行、策略选择、18维命令映射；learning/inference.py负责离线数据入口 | ACT输出动作chunk，可选时间集成 |
 | 机器人驱动 | 原有ROS功能包 | 模型不能自行打开串口或绕过驱动 |
 
 以后接模型，新增 `models/<name>/` 的配置、模型、适配器，在 `learning/registry.py` 注册并给一个训练YAML。
-适配器提供 `compute_loss`、`predict_chunk`、`validation_metrics`、`optimizer_groups`、`reset`，以及窗口/图像配置和统计量。
-模型需要的语言、历史观测或特殊编码应在其适配器中明确处理；公共契约需扩展时统一扩展，不能假设所有模型都和ACT完全一样。
+适配器提供 `compute_loss`、`predict_chunk`、`validation_spec`、`validation_metrics`、`optimizer_groups`、`reset`。
+`validation_spec()`声明主指标及min/max方向；`validation_metrics()`返回每项独立的 `MetricValue(value, weight)`，公共训练器加权汇总，不读取某个模型的padding或指标名称。
+`model_config()` 导出可恢复的模型构造配置；公共训练器不读取 ACT 的配置字段。
+`training_options(options, smoke=..., no_pretrained=...)` 负责模型自己的短训和预训练开关。
+构建模型之前，公共训练器先向注册的适配器类请求 `sample_spec(model_config, schema)` 和
+`statistics_spec(model_config, schema)`，按其声明准备数据与统计量；图像常量也由适配器声明，公共数据层不再写死ImageNet参数。
+`SampleSpec`支持当前帧、state/图像历史帧、任意动作偏移和`include_task`；窗口越过回合边界时返回填充标记，不跨回合取数据。
+`StatisticsSpec`支持mean/std、min/max、q01/q99及模型声明的常量。文本按每帧task_index解析；分词和特殊编码属于模型适配器。
+checkpoint记录采样声明、统计声明和实际统计量。公共读取器保留原始RGB分辨率，ACT在同一个prepare路径处理训练和实时图像；网络输入形状和归一化数值保持一致，Π0.5模型本体仍待接入。
 
 运行时已拆成三层：
 
@@ -36,6 +44,9 @@ RTC不是对所有动作块都能套用的通用平滑函数。公共层只统�
 以后放在`models/pi05/`并通过`create_rtc_runtime()`接入。当前ACT没有该能力，显式选择`rtc`
 会被拒绝，不会把普通异步队列冒充RTC。`PolicyExecutor`也不包含串口、ROS或安全阈值；
 这些仍由一个平台命令接收端转交现有统一控制器。
+
+普通动作块策略通过`chunk_execution_spec()`读取执行步数、预测时域和是否集成；
+需要集成时只调用适配器的`ensemble_action(chunk)`。公共运行时不再访问ACT内部的`policy.temporal_ensembler`。
 
 ACT源码固定自 LeRobot v0.4.3；`models/act/PROVENANCE.json` 保存上游地址、原文件哈希和修改说明。
 修改仅是本地配置、常量和基类依赖接线；网络、VAE和损失计算保留该版本实现。Apache-2.0许可证随模型保存。
@@ -130,7 +141,8 @@ python tools/learning.py train --config config/train/act.yaml --resume outputs/t
 续训校验数据文件哈希、回合划分、相机/单位、模型和优化设置。数据可换目录，内容不能悄悄换掉。
 相同CPU环境中，测试确认连续训练与2步保存后恢复到4步的所有权重逐元素一致；不承诺不同GPU后端跨设备逐位一致。
 training.pt是PyTorch训练状态，只读取自己信任的项目checkpoint。
-意外强杀留下.training.lock时，确认该目录没有训练进程后再移除锁；不能同时往同一训练目录写入。
+训练与数据集写入共用操作系统文件锁；异常退出后锁会自动释放，留下的锁文件可直接复用。
+不要删除仍被使用的锁文件，否则可能产生两个不同 inode 的并发写入。
 
 ## 离线推理与实机边界
 
@@ -138,7 +150,10 @@ training.pt是PyTorch训练状态，只读取自己信任的项目checkpoint。
 python tools/learning.py infer --checkpoint outputs/train/act_toys --dataset data/datasets/xyc/pick_toys_20261113_03 --episode 4 --frame 100 --output outputs/prediction.json
 ```
 
-checkpoint可用具体checkpoint目录或整个run目录（读取last指针）。加载时检查权重SHA256。
+checkpoint可用具体checkpoint目录或整个run目录。run目录按已完整提交的checkpoint步数选择最新权重；
+`last_checkpoint.json` 和 `best_checkpoint.json` 是从提交目录派生的索引；续训开始时重建，索引写入中断不改变已提交权重。
+离线推理和部署可用 `--checkpoint-selection best` 从 run 目录按适配器声明的验证指标直接选最佳权重，不依赖索引文件内容；默认 `latest` 选择最新提交。
+尚未提交的 `.checkpoint-*` 临时目录不参与选择；最新已提交目录损坏时明确报错，不悄悄回退。加载时检查权重SHA256。
 验证时必须保持相机名称与顺序、状态/动作名称与单位、FPS及标定资产一致。
 输出JSON包含50×18预测值、单位及首个动作的命名映射，没有电机写入。
 
@@ -151,7 +166,7 @@ checkpoint可用具体checkpoint目录或整个run目录（读取last指针）�
 训练标签沿用现有“观测后新生成并被驱动接受的请求动作”，没有擅自改成下一帧state。
 关节越界会拒绝；后四维只允许-1/0/+1，树莓派统一映射为升降0.015m/s、平移0.15m/s、旋转0.60rad/s。
 ROS执行层校验标定、控制来源、时间戳/有效期和速度限制，并独占已有驱动接口；遥操与策略不能争用。
-`RobotCommand` 是这套18维动作定义的 ROS 消息镜像；当前在线执行实际走本机回环控制通道。数据集、回放和模型运行时均使用同一动作定义：前14维目标位置，后4维三值命令。
+数据集、回放和模型运行时直接引用 `xyc.contracts` 中的18维动作定义。在线执行由统一控制通道转为 `SetArmTargets` 服务及底盘/升降速度话题，不另外维护未使用的控制消息。
 
 ## 推理运行记录
 
@@ -165,7 +180,7 @@ ROS执行层校验标定、控制来源、时间戳/有效期和速度限制，�
 | predictions.parquet | 每次网络调用的prediction_id、观测引用、原单位state、完整H×D动作块和推理耗时 |
 | steps.parquet | 逐步选择、真实下发结果、真实反馈三类记录，通过step_id关联；选择行另带prediction_id/chunk_index |
 | events.jsonl | 开始、reset、异常、人工接管等调用者事件、结束；每条包含UTC和记录主机单调时间 |
-| videos/相机名.mp4 | 开启视频后，每个被记录的选择步骤对应一帧，RGB/H264，包含配置中的所有相机 |
+| videos/相机名.mp4 | 开启视频后，每个被记录的选择步骤对应一帧，原始RGB观测/H264，包含配置中的所有相机 |
 
 steps的record_kind分别为selection、execution、feedback：
 
@@ -176,7 +191,7 @@ steps的record_kind分别为selection、execution、feedback：
 这三类数据是异步追加记录，不能把selection当作执行成功，也不能用旧反馈冒充执行结果。
 普通动作队列会记录每一步来自哪次预测的第几个动作；时间集成会列出参与合成的所有prediction_id/chunk_index。
 reset会清空待执行队列和集成历史，但运行内的日志编号不重新从1开始，避免关联到旧记录。
-当前离线回放只生成prediction和selection；execution、feedback接口等待ROS实际执行层接入，不会自动编造它们。
+离线推理只生成prediction和selection；实时`deploy`通过同一记录器保存execution和feedback，并标明各自时钟来源。
 
 示例：回放已有数据的30个观测，并保存四路画面，没有机器人控制：
 
@@ -191,7 +206,7 @@ Windows和Linux参数一致，使用安装ACT依赖的Python环境。
 
 离线默认不复制已有MP4，meta保存数据集身份、视频路径、回合和帧号，可以回溯原图。
 `--record-video`另存的是模型输入的RGB尺寸（当前ACT是240×320），不是原相机640×480图像。
-未来实时执行层可以通过video_frames参数提交原始RGB图像，每路尺寸在一个运行中必须固定。
+实时`deploy --record-video`保存对齐后的原始RGB观测，每路尺寸在一个运行中必须固定；不会复用归一化后的张量作为画面。
 视频时间网格为video_frame_index/fps，steps保存帧索引和对应的观测引用。
 视频容器30FPS不代表模型计算达到30Hz；推理耗时单独记录，离线来源时间明确标为数据集名义时间。
 实际ROS时间应由调用者注明source_clock；不同主机的单调时钟不能直接相减。
@@ -219,8 +234,15 @@ with InferenceRecorder.create(run_root, schema=adapter.schema,
 
 `PolicyExecutor.step()`固定执行“模型预测→策略选一帧→校验18维平台单位→命名映射→CommandSink.dispatch”。
 CommandSink返回`CommandResult`，再把真实接受结果和反馈写入同一条推理记录。
-实时`RobotControlSink`通过17886控制通道提交动作；ACT适配器从17883读取四路新JPEG并完成专用预处理。
+实时`RobotControlSink`通过17886控制通道提交动作；公共观测客户端从17883读取四路新JPEG，
+并从17886状态接口取得带树莓派ROS时间戳的双臂、底盘和升降反馈。
+ROS观测输出、录制和实时推理共用`src/xyc/observation.py`的`ObservationBuffer`：四相机时间差不超过33.3ms，
+按图像组的中间时间选取邻近状态，检查关节采样时间、标定和控制会话，并拒绝重复图像。
+这是读取时间配对，不是相机硬件同时曝光。ACT适配器只负责把配好的观测转换成ACT输入。
 后续模型只需实现自己的`live_batch()`预处理和模型适配器，不复制硬件控制与保护。
+
+树莓派ROS环境也需安装项目的轻量公共包：在项目根目录执行`python -m pip install -e . --no-deps`，
+随后构建ROS工作空间。该包的默认依赖不包含PyTorch，纯观测配对不会导入GPU模型。
 
 ## 实时模型控制
 
@@ -236,14 +258,36 @@ ros2 launch xyc_hardware policy.launch.py
 ssh -L 17883:127.0.0.1:17883 -L 17886:127.0.0.1:17886 pi5@树莓派地址
 ```
 
-在装有ACT和checkpoint的GPU电脑运行；缺少升降零点时才显式加`--home-lift`：
+在装有ACT和checkpoint的GPU电脑运行，默认先进入通用手动准备界面：
 
 ```bash
-python tools/learning.py deploy --checkpoint outputs/train/act_toys --device cuda --home-lift
+python tools/learning.py deploy --checkpoint outputs/train/act_toys --device cuda --record-video
 ```
 
+准备阶段不调用模型，有两种输入方式：`--prepare-mode teleop`使用本机两只已标定主臂控制双臂，
+`--prepare-mode keyboard`不打开任何主臂串口，双臂保持当前位置。这两种都用键盘控制底盘与升降。
+先按H完成缺失的升降回零，再用I/K调整高度、W/S前后、A/D平移、J/L旋转，空格停车。
+遥操准备复用采集入口的主臂读取、坏帧处理、标定换算及原有absolute跟随映射；不再保留另一套实现。
+确认姿态和场景后按P，模型才开始接管18维动作；再次按P暂停，原位保持并返回准备界面。
+每轮按P后先用当前观测预热模型，预热预测不下发；清空动作队列并读取新观测后才正式执行。
+推理中Y标记本轮成功、N标记失败并返回准备；未标记不计为成功。Q退出评估。
+切换时不重启驱动、不重新回零、不会自动升到某个任务高度。双臂保持上力，准备和模型使用同一个PolicyExecutor和机器人控制通道。
+这是所有模型共用的准备流程，不是ACT内部逻辑。键盘字母大小写均可，Linux和Windows控制台共用入口。
+主臂只在遥操准备阶段采样和生成手动目标；模型接管后暂停主臂采样，回到准备时恢复，始终只有一个命令来源。
+无人值守调用需显式加`--auto-start`；此时仍可用`--home-lift`允许缺少高度参考时下行回零。
+
+有限回归输出可能略超过标定端点（例如100.39）；公共执行边界将机械臂限制到完整[-100,100]、夹爪[0,100]范围，
+不限制单步幅度、不使用额外端点余量。原始模型动作与实际下发动作分别记录，NaN/Inf仍拒绝。
+人工示教数据和真实回放仍严格检查原始动作，不借此改写已录数据；电机自身及驱动的保护继续生效。
+
+实时部署默认记录到电脑项目的`outputs/inference/<运行编号>/`。
+`--record-dir`指定新目录，`--record-video`加存四路对齐画面，`--no-record`关闭记录。
+正常结束、Ctrl+C和异常停止都会结束记录并保存运行结果；记录器缓冲有界，跟不上时标明缺失，不阻塞电机控制。
+需要语言输入的适配器必须提供`--task "任务描述"`，程序会在连接并上力之前检查该要求。
+人工评估结果与准备/接管时间写入events.jsonl，便于逐轮统计；准备阶段的键盘目标不冒充模型预测。
+
 程序按checkpoint的FPS读取四路新图、18维反馈，调用ACT自己的实时预处理，再把动作送入与回放相同的
-双臂、底盘和升降控制器。相机时间差超过50ms、反馈/标定改变、推理严重落后、命令拒绝或连接中断都会停止。
+双臂、底盘和升降控制器。持续无法配出33.3ms以内的相机组、状态无法对齐、反馈/标定改变、推理严重落后、命令拒绝或连接中断都会停止。
 该接口已接通代码链路，但新模型第一次实机运行仍需现场看护；checkpoint训练完成不等于任务已经安全验证。
 
 记录器当前按单机器人batch=1保存。模型、归一化和标定版本等运行信息放入run_metadata。
@@ -270,7 +314,7 @@ python tools/learning.py deploy --checkpoint outputs/train/act_toys --device cud
 | --- | --- |
 | learning/replay.py | 电脑读取、预检查回合，按时发送动作；对齐初态、处理中断并保存执行日志 |
 | learning/dataset_metadata.py | 训练与回放共用v3元数据/数值读取，回放不依赖PyTorch |
-| xyc_hardware/replay_transport.py | 两端共用的协议、动作维度/限速校验、独占会话和顺序检查 |
+| xyc/transport/motion.py | 回放和实时推理共享的 TCP 客户端、协议和会话校验 |
 | xyc_hardware/motion_replay.py | 树莓派ROS节点，将动作交给已有双臂服务、底盘/升降速度话题，并核对接受回执 |
 | xyc_hardware/launch/replay.launch.py | 启动电机、双臂协调器及回放节点，command_source固定replay，不启动遥操控制器 |
 
@@ -349,7 +393,9 @@ python "$env:USERPROFILE\Desktop\实习准备\pi05_from_zero\tools\learning.py" 
 连续夹爪在共享的`JointControl`中单独处理，遥操与回放不各自实现一套。
 `0.3 A`和`load_raw=300`作为接触候选，不再因单帧超限就脱力；负载持续且编码器约120ms无进展时，
 夹爪将目标收回到当前位置附近8个编码器刻度，保持上力，并锁住继续闭合的目标；明确反向张开后解除锁存。
-接触和堵转的持续时间只累计相邻有效反馈；相邻反馈间断超过60ms会重新计时，避免把通信空档误算成持续受力。
+夹爪接触判定和机械堵转判定要求相邻反馈不超过60ms。电气过流使用公共 `CurrentProtection`，
+双臂、夹爪、底盘和升降共用计时实现：在允许的200ms反馈间隔内持续累计，10Hz反馈也会正常触发。
+低于相应电流阈值的新反馈会清除该计时；高电流前后间隔达到200ms时按保护监测丢失处理，不反复清零后继续上力。
 上力前会把STS寄存器48设为可配置扭矩上限，默认`100/1000`（10%最大输出扭矩），值由`gripper_torque_limit_raw`统一配置；
 这是舵机输出扭矩比例，不是指尖牛顿力。持续电流达到3.8 A约200ms、温度/反馈/通信异常仍会保护脱力。
 单个无效关节反馈帧不会立即脱力：底层先保持旧目标，连续丢失达到200ms才保护脱力；遥操层在此期间暂停发送新目标，
@@ -397,3 +443,15 @@ python "$env:USERPROFILE\Desktop\实习准备\pi05_from_zero\tools\learning.py" 
 自动验证包括PC协议/流程测试及树莓派隔离ROS测试（使用假总线和假底盘）。
 旧版比例速度契约下的实机日志不能作为当前三值命令契约的验证结果；
 新版需同步到树莓派并重新构建后再做实机验收。
+
+执行期限由公共 `PolicyExecutor` 检查。一次实时观测、预处理和预测若超过 0.25 秒，
+预测结果不会下发；剩余有效期随 v3 控制协议传到树莓派。底盘/升降经单个 `MobileCommand` 携带相同绝对期限，接收端、周期执行和串口写入前均检查，不会因ROS排队而获得新的有效期。升级后需同步并重新编译 `xyc_interfaces` 与后端，
+协议版本不匹配时会在准备阶段拒绝控制，不采用旧目标重试。
+
+动作最后四维始终是 `-1/0/+1`，状态保留实际物理单位。各轴名义速度从公共契约读取；
+平移与旋转的组合超过轮速上限时，底层统一按相同比例缩小三个机体速度，保留方向和旋转比例。
+录制动作仍保存原三值指令，实测速度保存在 state。数据读取器不再自动把旧速度或比例动作改写成三值。
+
+回合提交先持久化日志和元数据备份，再移动数据、视频和统计文件，最后更新 `info.json`。
+若提交中断，恢复同一树莓派缓存时：已提交回合保留并返回保存回执；未完成回合先回滚其文件和统计，
+然后重传。正在运行的客户端可按 B 重试；重启客户端使用同名配置和 `--resume`。

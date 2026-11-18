@@ -1,12 +1,12 @@
-# SPDX-License-Identifier: Apache-2.0
 """Convert one fresh feedback batch into calibrated model coordinates."""
 
-import hashlib
-import json
+from xyc.io import content_id
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 
 from xyc_interfaces.msg import ArmState
-from xyc_hardware.arm_calibration import (
+from xyc.robot.calibration import (
     FEEDBACK_ENDPOINT_TOLERANCE_TICKS, arm_names, check_hardware, normalize_tick,
 )
 
@@ -19,9 +19,7 @@ class ArmStateConverter:
         self.document = document
         self.arm = document['arm']
         self.names = arm_names(self.arm)
-        encoded = json.dumps(document, sort_keys=True, separators=(',', ':'),
-                             ensure_ascii=False, allow_nan=False).encode()
-        self.calibration_id = hashlib.sha256(encoded).hexdigest()
+        self.calibration_id = content_id(document)
 
     def convert(self, feedback):
         state = ArmState()

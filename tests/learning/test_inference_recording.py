@@ -11,10 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from xyc.learning.contracts import ACTION_NAMES, CAMERAS, OBS_STATE, STATE_NAMES, PolicySchema
+from xyc.contracts import ACTION_NAMES, CAMERAS, OBS_STATE, STATE_NAMES, PolicySchema
 from xyc.learning.inference import PolicyRunner, predict_dataset
 from xyc.learning.inference_recording import InferenceRecorder
 from xyc.models.act.modeling_act import ACTTemporalEnsembler
+from xyc.runtime.strategies.base import ChunkExecutionSpec
 
 
 def schema():
@@ -32,6 +33,13 @@ class FakePolicy:
         self.calls = 0
         if coefficient is not None:
             self.policy = SimpleNamespace(temporal_ensembler=ACTTemporalEnsembler(coefficient, 4))
+
+    def chunk_execution_spec(self):
+        return ChunkExecutionSpec(self.config.n_action_steps, self.config.chunk_size,
+                                  self.config.temporal_ensemble_coeff is not None)
+
+    def ensemble_action(self, chunk):
+        return self.policy.temporal_ensembler.update(chunk)
 
     def reset(self):
         if self.config.temporal_ensemble_coeff is not None:

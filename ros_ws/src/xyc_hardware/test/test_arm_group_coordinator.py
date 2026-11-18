@@ -20,12 +20,14 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import String
 from xyc_interfaces.msg import ArmState
 from xyc_interfaces.srv import ArmBusTransaction as ArmBusTransactionSrv, SetArmTargets
-from xyc_hardware.arm_calibration import arm_names
+from xyc.robot.calibration import arm_names
 from xyc_hardware.arm_group_coordinator import ArmGroupCoordinator
 from xyc_hardware.arm_joint_control import ArmBusHold, ArmBusTransaction, JointControl
+from xyc_hardware.chassis_control import TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC
 from xyc_hardware.motor_state_node import MotorStateNode
 from xyc_hardware.teleop_nodes import TeleopController, LocalArmClient, controller_components
-from xyc_hardware.teleop_transport import TELEOP_TARGET_DROPPED, BackendLease, running_backend_pids
+from xyc.transport.teleop import TELEOP_TARGET_DROPPED
+from xyc.transport.lease import BackendLease, running_backend_pids
 from test_arm_calibration import fixture
 from test_joint_control import FakeJoint
 
@@ -33,18 +35,20 @@ from test_joint_control import FakeJoint
 class FakeBus(Node):
     group_transaction = MotorStateNode.group_transaction
     command_deadline = MotorStateNode.command_deadline
+    on_teleop_fault = MotorStateNode.on_teleop_fault
+    stop_arm = MotorStateNode.stop_arm
 
     def __init__(self, side):
         super().__init__('fake_bus_' + side)
         self.side = side
+        self.bus = side
+        self.chassis = None
         self.group_session_id = 'session' + side
         self.fail_target_commit = False
-        self.streaming_targets_enabled = True
         self.operations = []
         self.fail_hold_commit = False
-        self.delay_target_prepare = 0.
         self.delay_target_commit = 0.
-        self.target_prepare_barrier = None
+        self.target_barrier = None
         doc = fixture(side)[2]
         self.motors = {}
         controls = {}
@@ -54,25 +58,37 @@ class FakeBus(Node):
             motor.bus = side
             self.motors[name] = motor
             controls[name] = JointControl(motor, entry)
-        group = ArmBusHold(side, controls, max_prepare_age_s=5.)
+        group = ArmBusHold(
+            side, controls, max_prepare_age_s=5.,
+            write_group_goals=self.write_arm_goals,
+            read_group_snapshot=self.read_arm_control_snapshot,
+        )
         self.arm_transaction = ArmBusTransaction(group, timeout_s=5.)
         self.service = self.create_service(ArmBusTransactionSrv, f'/motors/{side}/group/transaction', self.handle_transaction)
         self.pub = self.create_publisher(ArmState, f'/motors/{side}/state', qos_profile_sensor_data)
         self.timer = self.create_timer(.05, self.publish_state)
 
+    def write_arm_goals(self, goals, *, deadline):
+        for motor in self.motors.values():
+            if motor.joint_id in goals:
+                motor.write_goal(goals[motor.joint_id])
+
+    def read_arm_control_snapshot(self):
+        return {
+            motor.joint_id: (motor.read_coordinate_settings([motor.joint_id])[motor.joint_id],
+                             motor.read_torque(), motor.read_joint())
+            for motor in self.motors.values()
+        }
+
     def handle_transaction(self, request, response):
         self.operations.append(request.operation)
-        if request.operation == 'prepare_targets':
-            if self.target_prepare_barrier is not None:
-                self.target_prepare_barrier.wait(timeout=1.)
-            if self.delay_target_prepare:
-                time.sleep(self.delay_target_prepare)
-        pending_kind = self.arm_transaction.pending[0] if self.arm_transaction.pending else ''
-        if (request.operation == 'stream_targets' or request.operation == 'commit' and pending_kind == 'targets') and self.delay_target_commit:
-            time.sleep(self.delay_target_commit)
-        if (request.operation in ('commit', 'stream_targets')
-                and ((self.fail_target_commit and (pending_kind == 'targets' or request.operation == 'stream_targets'))
-                     or (self.fail_hold_commit and pending_kind == 'hold'))):
+        if request.operation == 'stream_targets':
+            if self.target_barrier is not None:
+                self.target_barrier.wait(timeout=1.)
+            if self.delay_target_commit:
+                time.sleep(self.delay_target_commit)
+        if ((request.operation == 'stream_targets' and self.fail_target_commit)
+                or (request.operation == 'commit_hold' and self.fail_hold_commit)):
             response.success = False
             response.session_id = self.group_session_id
             response.state = self.arm_transaction.group.state
@@ -96,7 +112,7 @@ class FakeBus(Node):
                      os.environ.get('ROS_DOMAIN_ID') == '181', 'requires isolated ROS domain 181')
 class TestArmGroupCoordinator(unittest.TestCase):
     def setUp(self):
-        rclpy.init(args=['--ros-args', '-p', 'group_mode:=true'])
+        rclpy.init(args=['--ros-args', '-p', 'group_mode:=true', '-p', 'teleop_controller:live:=true'])
         self.left = FakeBus('left')
         self.right = FakeBus('right')
         self.coordinator = ArmGroupCoordinator()
@@ -133,12 +149,57 @@ class TestArmGroupCoordinator(unittest.TestCase):
     def target_request(self):
         req = SetArmTargets.Request()
         req.header.stamp = self.client.get_clock().now().to_msg()
-        req.source_id = 'keyboard'
+        req.source_id = 'teleop'
         req.sequence = 1
         req.valid_for.sec = 2
         req.arm_calibration_ids = ['calibrationleft', 'calibrationright']
         req.position_normalized = [1.] * 6 + [51.] + [1.] * 6 + [51.]
         return req
+
+    def test_rejected_target_stops_both_arms_and_latches_their_old_session(self):
+        buses = (self.left, self.right)
+        for bus in buses:
+            bus.create_subscription(String, TELEOP_FAULT_TOPIC, bus.on_teleop_fault, TELEOP_FAULT_QOS)
+        controller = TeleopController()
+        self.executor.add_node(controller)
+        try:
+            self.assertTrue(controller.live)
+            deadline = time.monotonic() + 3.
+            while controller.fault_publisher.get_subscription_count() < 2 and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(controller.fault_publisher.get_subscription_count(), 2)
+            self.assertTrue(self.call(self.start, Trigger.Request()).success)
+            self.assertTrue(self.call(self.target, self.target_request()).accepted)
+            joints = [joint for bus in buses for joint in bus.arm_transaction.group.controls.values()]
+            self.assertTrue(all(joint.owned and joint.busy and joint.driver.torque == 1 for joint in joints))
+
+            rejected = self.target_request()
+            rejected.sequence = 2
+            rejected.arm_calibration_ids[0] = 'changed'
+            controller.response_deadline = time.monotonic() + 1.2
+            controller.pending = controller.client.call_async(rejected)
+            deadline = time.monotonic() + 3.
+            while not all(bus.arm_transaction.group.state == 'fault' for bus in buses) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(controller.stopped)
+            for bus in buses:
+                self.assertEqual(bus.arm_transaction.group.state, 'fault')
+                self.assertIn('calibration mismatch', bus.arm_transaction.group.reason)
+            self.assertTrue(all(not joint.owned and not joint.busy and joint.driver.torque == 0 for joint in joints))
+            self.assertTrue(all(joint.driver.writes[-1] == ('torque', False) for joint in joints))
+
+            writes = [list(joint.driver.writes) for joint in joints]
+            fresh = self.target_request()
+            fresh.sequence = 3
+            fresh.position_normalized = [10.] * 14
+            self.assertFalse(self.call(self.target, fresh).accepted)
+            for bus in buses:
+                with self.assertRaisesRegex(ValueError, 'not idle'):
+                    bus.arm_transaction.prepare_hold('100')
+            self.assertEqual(writes, [joint.driver.writes for joint in joints])
+        finally:
+            self.executor.remove_node(controller)
+            controller.destroy_node()
 
     def test_recording_event_identifies_only_successfully_sent_commands(self):
         events = []
@@ -189,11 +250,10 @@ class TestArmGroupCoordinator(unittest.TestCase):
 
     def test_streaming_has_one_rpc_per_bus_and_retains_startup_handshake(self):
         self.coordinator.source = 'teleop'
-        self.coordinator.streaming_targets = True
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
         for bus in (self.left, self.right):
             self.assertIn('prepare_hold', bus.operations)
-            self.assertIn('commit', bus.operations)
+            self.assertIn('commit_hold', bus.operations)
             bus.operations.clear()
         request = self.target_request()
         request.source_id = 'teleop'
@@ -205,7 +265,6 @@ class TestArmGroupCoordinator(unittest.TestCase):
 
     def test_streaming_partial_failure_releases_both_buses(self):
         self.coordinator.source = 'teleop'
-        self.coordinator.streaming_targets = True
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
         self.right.fail_target_commit = True
         request = self.target_request()
@@ -218,7 +277,6 @@ class TestArmGroupCoordinator(unittest.TestCase):
 
     def test_one_expired_stream_and_one_confirmed_success_replan_without_releasing(self):
         self.coordinator.source = 'teleop'
-        self.coordinator.streaming_targets = True
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
         events = []
         sub = self.client.create_subscription(String, '/robot/arms/recording_command',
@@ -247,7 +305,6 @@ class TestArmGroupCoordinator(unittest.TestCase):
 
     def test_local_client_uses_the_same_transaction_and_reports_failures(self):
         self.coordinator.source = 'teleop'
-        self.coordinator.streaming_targets = True
         starter = LocalArmClient(self.coordinator, self.coordinator.start, Trigger.Response)
         self.assertTrue(starter.call_async(Trigger.Request()).result(timeout=5.).success)
         client = LocalArmClient(self.coordinator, self.coordinator.set_targets, SetArmTargets.Response)
@@ -263,34 +320,18 @@ class TestArmGroupCoordinator(unittest.TestCase):
         self.assertTrue(all(motor.torque == 0 for bus in (self.left, self.right)
                             for motor in bus.motors.values()))
 
-    def test_partial_commit_attempts_release_on_both_fake_buses(self):
-        self.assertTrue(self.call(self.start, Trigger.Request()).success)
-        self.right.fail_target_commit = True
-        result = self.call(self.target, self.target_request())
-        self.assertFalse(result.accepted)
-        self.assertEqual(self.coordinator.phase, 'fault')
-        self.assertTrue(all(m.torque == 0 for m in (*self.left.motors.values(), *self.right.motors.values())))
 
-    def test_target_preparations_overlap_and_abort_on_peer_rejection(self):
+
+    def test_parallel_batches_release_both_buses_on_peer_inspection_failure(self):
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
-        self.left.target_prepare_barrier = self.right.target_prepare_barrier = threading.Barrier(2)
-        request = self.target_request()
-        targets = list(request.position_normalized)
-        targets[0] = 99.  # A large calibrated target is valid; use a real hardware mismatch instead.
+        self.left.target_barrier = self.right.target_barrier = threading.Barrier(2)
         self.left.motors['arm_left_shoulder_pan'].entry['hardware_homing_offset'] += 1
-        request.position_normalized = targets
-        rejected = self.call(self.target, request)
+        rejected = self.call(self.target, self.target_request())
         self.assertFalse(rejected.accepted)
-        self.assertIn('left: prepare_targets rejected', rejected.message)
-        self.assertIsNone(self.right.arm_transaction.pending)
-        self.assertTrue(all(sum(k == 'goal' for k, _ in motor.writes) == 1
-                            for motor in (*self.left.motors.values(), *self.right.motors.values())))
-
-        self.left.motors['arm_left_shoulder_pan'].entry['hardware_homing_offset'] -= 1
-        request = self.target_request()
-        request.sequence = 2
-        accepted = self.call(self.target, request)
-        self.assertTrue(accepted.accepted, accepted.message)
+        self.assertIn('left: stream_targets rejected', rejected.message)
+        self.assertEqual(self.coordinator.phase, 'fault')
+        self.assertTrue(all(m.torque == 0 for bus in (self.left, self.right)
+                            for m in bus.motors.values()))
 
     def test_wrong_source_and_calibration_do_not_write_goals(self):
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
@@ -323,14 +364,14 @@ class TestArmGroupCoordinator(unittest.TestCase):
                 bus.timer = bus.create_timer(1 / 60, bus.publish_state)
             self.coordinator.source = 'teleop'
             self.assertTrue(self.call(self.start, Trigger.Request()).success)
-            self.left.delay_target_prepare = self.right.delay_target_prepare = .08
+            self.left.delay_target_commit = self.right.delay_target_commit = .08
             began = time.monotonic()
             request = self.target_request()
             request.source_id = 'teleop'
             self.assertTrue(self.call(self.target, request).accepted)
             self.assertTrue(all(received > began + .02
                                 for received, _ in self.coordinator.states.values()))
-            self.left.delay_target_prepare = self.right.delay_target_prepare = 0.
+            self.left.delay_target_commit = self.right.delay_target_commit = 0.
             for sequence in range(2, 62):
                 request = self.target_request()
                 request.source_id = 'teleop'
@@ -345,19 +386,24 @@ class TestArmGroupCoordinator(unittest.TestCase):
             coordinator_executor.remove_node(self.coordinator)
             self.executor.add_node(self.coordinator)
 
-    def test_expired_target_during_preflight_does_not_release_or_move(self):
+    def test_expired_policy_batches_do_not_release_or_move(self):
+        self.coordinator.source = 'policy'
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
-        self.right.delay_target_prepare = 2.1
-        result = self.call(self.target, self.target_request())
+        self.left.delay_target_commit = self.right.delay_target_commit = .28
+        request = self.target_request()
+        request.source_id = 'policy'
+        request.valid_for.sec, request.valid_for.nanosec = 0, 250_000_000
+        result = self.call(self.target, request)
         self.assertFalse(result.accepted)
+        self.assertNotEqual(result.message, TELEOP_TARGET_DROPPED)
         self.assertEqual(self.coordinator.phase, 'holding')
         self.assertTrue(all(m.torque == 1 and sum(k == 'goal' for k, _ in m.writes) == 1
-                            for m in (*self.left.motors.values(), *self.right.motors.values())))
+                            for bus in (self.left, self.right) for m in bus.motors.values()))
 
-    def test_expired_teleop_preflight_is_skipped_and_the_next_target_runs(self):
+    def test_expired_teleop_batches_are_skipped_and_the_next_target_runs(self):
         self.coordinator.source = 'teleop'
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
-        self.right.delay_target_prepare = .42
+        self.left.delay_target_commit = self.right.delay_target_commit = .38
         request = self.target_request()
         request.source_id = 'teleop'
         request.valid_for.sec = 0
@@ -368,38 +414,24 @@ class TestArmGroupCoordinator(unittest.TestCase):
         self.assertTrue(all(m.torque == 1 and sum(k == 'goal' for k, _ in m.writes) == 1
                             for m in (*self.left.motors.values(), *self.right.motors.values())))
 
-        self.right.delay_target_prepare = 0.
+        self.left.delay_target_commit = self.right.delay_target_commit = 0.
         request = self.target_request()
         request.source_id = 'teleop'
         request.sequence = 2
         result = self.call(self.target, request)
         self.assertTrue(result.accepted, result.message)
 
-    def test_teleop_recovers_only_if_both_commits_confirm_no_write(self):
-        self.coordinator.source = 'teleop'
+    def test_unconfirmed_stream_outcome_releases_both_buses(self):
         self.assertTrue(self.call(self.start, Trigger.Request()).success)
-
-        def short_request(sequence):
-            request = self.target_request()
-            request.source_id = 'teleop'
-            request.sequence = sequence
-            request.valid_for.sec = 0
-            request.valid_for.nanosec = 250_000_000
-            return request
-
-        self.left.delay_target_commit = self.right.delay_target_commit = .28
-        result = self.call(self.target, short_request(1))
-        self.assertEqual(result.message, TELEOP_TARGET_DROPPED)
-        self.assertEqual(self.coordinator.phase, 'holding')
-        self.assertTrue(all(m.torque == 1 and sum(k == 'goal' for k, _ in m.writes) == 1
-                            for m in (*self.left.motors.values(), *self.right.motors.values())))
-
-        self.left.delay_target_commit = 0.
-        result = self.call(self.target, short_request(2))
+        self.right.delay_target_commit = .50
+        request = self.target_request()
+        request.valid_for.sec, request.valid_for.nanosec = 0, 250_000_000
+        result = self.call(self.target, request)
         self.assertFalse(result.accepted)
         self.assertNotEqual(result.message, TELEOP_TARGET_DROPPED)
         self.assertEqual(self.coordinator.phase, 'fault')
-        self.assertTrue(all(m.torque == 0 for m in (*self.left.motors.values(), *self.right.motors.values())))
+        self.assertTrue(all(m.torque == 0 for bus in (self.left, self.right)
+                            for m in bus.motors.values()))
 
     def test_one_bus_cannot_complete_hold_leaves_no_fake_motor_powered(self):
         self.right.fail_hold_commit = True
@@ -435,7 +467,7 @@ class TestArmGroupCoordinator(unittest.TestCase):
 class TestBackendLease(unittest.TestCase):
     def test_duplicate_launch_is_rejected_and_shutdown_releases_the_lock(self):
         with tempfile.TemporaryDirectory() as directory, \
-                patch('xyc_hardware.teleop_transport.running_backend_pids', return_value=[]):
+                patch('xyc.transport.lease.running_backend_pids', return_value=[]):
             first, second = BackendLease(directory), BackendLease(directory)
             options = dict(with_motors=True, with_cameras=True, recording=True)
             first.acquire(**options)
@@ -462,7 +494,7 @@ class TestBackendLease(unittest.TestCase):
             options = dict(with_cameras=False, recording=False, proc_root=proc)
             self.assertEqual(running_backend_pids(project, with_motors=True, **options), [111, 222])
             self.assertEqual(running_backend_pids(project, with_motors=False, **options), [222])
-            with patch('xyc_hardware.teleop_transport.running_backend_pids', return_value=[222]):
+            with patch('xyc.transport.lease.running_backend_pids', return_value=[222]):
                 lease = BackendLease(project)
                 with self.assertRaisesRegex(RuntimeError, 'PID=\\[222\\]'):
                     lease.acquire(with_motors=True, with_cameras=False, recording=False)
@@ -473,7 +505,7 @@ class TestTeleopAcknowledgement(unittest.TestCase):
     def test_event_wakeups_do_not_restart_a_latched_fault(self):
         node = SimpleNamespace(control_wake=Mock(), pending=None, leaders={}, stopped=False,
                                update_targets=Mock(side_effect=RuntimeError('hardware fault')),
-                               timer=Mock(), get_logger=Mock())
+                               timer=Mock(), get_logger=Mock(), fault_publisher=Mock())
         node.wake_control = lambda: TeleopController.wake_control(node)
         TeleopController.on_leader(node, 'left', 'first frame')
         node.control_wake.trigger.assert_called_once()
@@ -483,6 +515,8 @@ class TestTeleopAcknowledgement(unittest.TestCase):
         TeleopController.tick(node)
         node.control_wake.trigger.assert_called_once()
         node.update_targets.assert_called_once()
+        node.fault_publisher.publish.assert_called_once()
+        self.assertIn('hardware fault', node.fault_publisher.publish.call_args.args[0].data)
 
     def test_slow_acknowledgement_waits_and_expired_preflight_replans(self):
         reply = Mock()
@@ -547,7 +581,7 @@ class TestMotorGroupInitialization(unittest.TestCase):
             self.assertTrue(nodes[0].client.in_process)
             self.assertTrue(nodes[0].start_client.in_process)
             self.assertEqual(nodes[1].phase, 'idle')
-            self.assertTrue(nodes[1].streaming_targets)
+            self.assertEqual(nodes[1].source, 'teleop')
         finally:
             for node in reversed(nodes):node.destroy_node()
             rclpy.shutdown()
@@ -575,7 +609,7 @@ class TestMotorGroupInitialization(unittest.TestCase):
                 pass
             def motion_profile(self, motor_id):
                 return (2000, 100) if motor_id == 7 else (2400, 120)
-            def write_arm_goals(self, goals):
+            def write_arm_goals(self, goals, *, deadline):
                 FakeDriver.writes.append(('group_goals', goals))
             def read_arm_control_snapshot(self):
                 return {}
@@ -597,6 +631,7 @@ class TestMotorGroupInitialization(unittest.TestCase):
                     self.assertTrue(node.group_mode)
                     self.assertEqual(set(node.joint_controls), set(names))
                     self.assertEqual(node.arm_transaction.group.state, 'idle')
+                    self.assertEqual(node.count_subscribers(TELEOP_FAULT_TOPIC), 1)
                     self.assertEqual(FakeDriver.writes, [])
             finally:
                 if node is not None:

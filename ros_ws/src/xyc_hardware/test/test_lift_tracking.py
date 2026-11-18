@@ -17,12 +17,9 @@ class TestLiftTracking(unittest.TestCase):
         self.assertAlmostEqual(height, 0.)
         self.assertEqual(tracker.extended_delta_ticks, 0)
 
-    def test_direction_and_target_ticks_follow_verified_reference(self):
+    def test_direction_follows_verified_reference(self):
         tracker = LiftTracker(self.geometry(-1), reference_id='test-session', zero_tick=1000, reference_time_s=1.)
         self.assertAlmostEqual(tracker.update(990, 1.02), 10 * .1 / 4096)
-        self.assertEqual(tracker.height_to_delta_ticks(.1), -4096)
-        with self.assertRaises(ValueError):
-            tracker.height_to_delta_ticks(.61)
 
     def test_lost_feedback_latches_invalid_and_requires_new_reference(self):
         for raw, timestamp in ((1000, 2.), (1300, 1.02), (1000, .5), (4096, 1.02)):
@@ -60,8 +57,6 @@ class TestLiftTracking(unittest.TestCase):
             tracker = LiftTracker(geometry, reference_id='homed', zero_tick=2000,
                                   reference_time_s=1.)
             self.assertEqual(tracker.update(tick, 1.1), expected)
-            with self.assertRaisesRegex(ValueError, 'Target height'):
-                tracker.height_to_delta_ticks(-.00001)
         for tick in (1989, 2111):
             tracker = LiftTracker(geometry, reference_id='homed', zero_tick=2000,
                                   reference_time_s=1.)

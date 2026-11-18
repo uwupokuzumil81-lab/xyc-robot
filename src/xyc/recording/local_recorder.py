@@ -1,5 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
 """Desktop dataset receiver, independent of ROS and robot control."""
+
+from xyc.robot.profile import robot_profile
+# SPDX-License-Identifier: Apache-2.0
 
 import http.client
 import hashlib
@@ -14,12 +16,13 @@ from uuid import uuid4
 from .config import checked_config
 from .stream import MAX_PACKET, unpack_event
 from .cache import framed_capture
-from .alignment import ACTION_SEMANTICS, ACTION_UNITS, RECORDING_CONTRACT, STATE_UNITS
+from xyc.contracts import ACTION_SEMANTICS, ACTION_UNITS, STATE_UNITS
+from .alignment import RECORDING_CONTRACT
 
 
 class LocalDatasetReceiver:
-    def __init__(self, datasets_dir, config, *, url='http://localhost:17883/api/recording',
-                 width=640, height=480):
+    def __init__(self, datasets_dir, config, *, url=None,
+                 width=None, height=None):
         try:
             from .writer import LeRobotV3Writer
         except ModuleNotFoundError as exc:
@@ -27,8 +30,11 @@ class LocalDatasetReceiver:
         self.writer_factory = LeRobotV3Writer
         self.datasets_dir = Path(datasets_dir).expanduser().resolve()
         self.config = checked_config(config)
-        self.width, self.height = width, height
-        address = urlsplit(url)
+        default_height, default_width = robot_profile().image_size
+        self.width = default_width if width is None else width
+        self.height = default_height if height is None else height
+        width, height = self.width, self.height
+        address = urlsplit(url or f"http://localhost:{robot_profile().ports['data']}/api/recording")
         if address.scheme != 'http' or address.hostname not in ('localhost', '127.0.0.1', '::1'):
             raise ValueError('Recording must use a local SSH-forwarded HTTP endpoint')
         self.address = (address.hostname, address.port or 80)
@@ -85,7 +91,7 @@ class LocalDatasetReceiver:
             raise ConnectionError('Invalid recording response length')
         packet = response.read(length)
         if response.status != 200 or len(packet) != length:
-            raise ConnectionError(f'电脑采集通道未就绪（HTTP {response.status}），请检查后端版本及17883转发')
+            raise ConnectionError(f'电脑采集通道未就绪（HTTP {response.status}），请检查后端版本及{self.address[1]}转发')
         return packet
 
     def heartbeat(self):
@@ -137,8 +143,14 @@ class LocalDatasetReceiver:
         if operation == 'begin':
             cache_id = payload.get('cache_id')
             if cache_id is not None:
-                if not isinstance(cache_id, str) or len(cache_id) != 32 or any(c not in '0123456789abcdef' for c in cache_id):
+                if not self.writer.is_transfer_id(cache_id):
                     raise ValueError('Invalid episode cache identity')
+                if self.writer.committing:
+                    self.writer.close()
+                    self.writer = self.writer_factory(
+                        self.datasets_dir, {**self.config, 'resume': True},
+                        robot_assets=self.robot_assets, width=self.width, height=self.height,
+                        recover_transfer_id=cache_id)
                 result = self.receipt(cache_id)
                 if result is not None:
                     self.update(saved_episodes=self.writer.info['total_episodes'], frames=result['frames'])
@@ -147,12 +159,9 @@ class LocalDatasetReceiver:
                     if self.cache_id != cache_id:
                         raise ValueError('Another episode is still pending; refusing to discard it')
                     self.writer.discard()
-            self.writer.begin()
+            self.writer.begin(cache_id=cache_id)
             self.cache_id = cache_id
             self.capture_digest = hashlib.sha256()
-            if cache_id:
-                from .writer import json_write
-                json_write(self.writer.stage / 'transfer.json', {'cache_id': cache_id})
             self.update(frames=0, error='', message='等待完整新样本，保存位置：本地电脑')
         elif operation == 'capture':
             self.writer.add(event['capture'])
@@ -167,9 +176,9 @@ class LocalDatasetReceiver:
             result = self.writer.save(interruption=payload.get('interruption'), transfer_id=self.cache_id,
                                       transfer_sha256=self.capture_digest.hexdigest() if self.cache_id else None)
             if self.cache_id:
-                from .writer import json_write
+                from xyc.io import write_json
                 result.update(cache_id=self.cache_id, cache_sha256=self.capture_digest.hexdigest())
-                json_write(self.writer.root / 'meta/transfers' / (self.cache_id + '.json'), result)
+                write_json(self.writer.root / 'meta/transfers' / (self.cache_id + '.json'), result)
             self.update(saved_episodes=self.writer.info['total_episodes'], frames=result['frames'],
                         message=f'本地已保存 {result["frames"]}帧，实际{result["fresh_fps"]:.2f}FPS')
             return {**result, 'info': self.info()}
@@ -186,7 +195,7 @@ class LocalDatasetReceiver:
         return {}
 
     def receipt(self, cache_id):
-        if not isinstance(cache_id, str) or len(cache_id) != 32 or any(c not in '0123456789abcdef' for c in cache_id):
+        if not self.writer.is_transfer_id(cache_id):
             raise ValueError('Invalid episode cache identity')
         path = self.writer.root / 'meta/transfers' / (cache_id + '.json')
         if path.is_file():

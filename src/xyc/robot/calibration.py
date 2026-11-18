@@ -1,10 +1,12 @@
-# SPDX-License-Identifier: Apache-2.0
 """Arm-only passive calibration; retain the servo's existing EEPROM zero.
 
 The feedback node remains read-only. This separate, exclusive-port tool can
 release torque on IDs 1..7 after an interactive prompt. It cannot enable torque,
 send goals, or write EEPROM. Software reference/ranges are not URDF calibration.
 """
+
+from xyc.io import write_json
+# SPDX-License-Identifier: Apache-2.0
 
 import argparse
 from datetime import datetime, timezone
@@ -16,11 +18,10 @@ import select
 import shutil
 import statistics
 import sys
-import tempfile
 import time
 from uuid import uuid4
 
-from xyc_hardware.feetech_reader import FeetechReader, decode_feedback, signed_magnitude
+from xyc.robot.feetech import FeetechReader, decode_feedback, signed_magnitude
 
 
 JOINTS = (
@@ -44,12 +45,10 @@ def integer(value, minimum, maximum):
     return value
 
 
-def load_arm_spec(path, arm):
-    import yaml
-
+def follower_spec(arm, profile=None):
+    from xyc.robot.profile import robot_profile
+    params = (profile or robot_profile()).motor_parameters(arm)
     names = arm_names(arm)
-    config = yaml.safe_load(Path(path).read_text())
-    params = config[f'/motors/{arm}/motor_state']['ros__parameters']
     ids, configured_names, models = (
         params['motor_ids'], params['motor_names'], params['model_numbers']
     )
@@ -323,24 +322,12 @@ def save_document(path, document):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
         raise ValueError('Calibration output must not be a symbolic link')
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
-                                         prefix='.' + path.name, suffix='.tmp', delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write('\n')
-            stream.flush()
-            os.fsync(stream.fileno())
-        if path.exists():
-            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-            backup = path.with_name(f'{path.stem}.backup-{stamp}-{uuid4().hex[:8]}.json')
-            shutil.copy2(path, backup)
-            print(f'旧文件已备份：{backup}')
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
+    if path.exists():
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        backup = path.with_name(f'{path.stem}.backup-{stamp}-{uuid4().hex[:8]}.json')
+        shutil.copy2(path, backup)
+        print(f'旧文件已备份：{backup}')
+    write_json(path, document)
 
 
 def stable_reference(reader):
@@ -434,8 +421,8 @@ def record(reader, spec, before):
 def main(args=None):
     parser = argparse.ArgumentParser(description='左右臂标定：默认只检查，--record 才交互采集')
     parser.add_argument('--arm', required=True, choices=('left', 'right'))
-    parser.add_argument('--config', type=Path, help='默认使用本包已安装的 motors.yaml')
-    parser.add_argument('--output', type=Path, help='默认 ~/pi05_from_zero/config/calibration/left.json 或 right.json')
+    parser.add_argument('--robot-config', type=Path, help='机器人配置；默认使用公共 profile.yaml')
+    parser.add_argument('--output', type=Path, help='默认使用机器人项目目录下 config/calibration 的相应文件')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--check', action='store_true', help='只读检查硬件与已有标定（默认）')
     modes.add_argument('--record', action='store_true', help='交互脱力、记录参考姿态与活动范围')
@@ -445,13 +432,10 @@ def main(args=None):
     try:
         if options.record and not sys.stdin.isatty():
             raise ValueError('实际标定必须在实机旁的交互终端运行')
-        if options.config is None:
-            from ament_index_python.packages import get_package_share_directory
-            options.config = Path(get_package_share_directory('xyc_hardware')) / 'config/motors.yaml'
-        spec = load_arm_spec(options.config, options.arm)
-        output = options.output or (
-            Path.home() / 'pi05_from_zero/config/calibration' / f'{options.arm}.json'
-        )
+        from xyc.robot.profile import load_profile, robot_profile
+        profile = load_profile(str(options.robot_config.expanduser().resolve())) if options.robot_config else robot_profile()
+        spec = follower_spec(options.arm, profile)
+        output = options.output or (profile.robot_root / 'config/calibration' / f'{options.arm}.json')
         if options.import_file is not None:
             legacy = json.loads(options.import_file.expanduser().read_text())
             document = import_legacy(spec, legacy)

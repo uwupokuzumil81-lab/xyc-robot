@@ -7,22 +7,24 @@ import socket
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import rclpy
-from geometry_msgs.msg import TwistStamped
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from xyc_interfaces.msg import ArmState
+from xyc_interfaces.msg import ArmState, MobileCommand
 
 from xyc_hardware.arm_group_coordinator import ArmGroupCoordinator
-from xyc_hardware.arm_calibration import denormalize_tick, normalize_tick
-from xyc_hardware.chassis_control import COMMAND_QOS
+from xyc.robot.calibration import denormalize_tick, normalize_tick
+from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS
 from xyc_hardware.motion_replay import MotionReplay
-from xyc_hardware.replay_transport import ACTION_NAMES, ACTION_UNITS, STATE_NAMES, STATE_UNITS, PROTOCOL, receive, send
+from xyc.contracts import ACTION_NAMES, ACTION_UNITS, STATE_NAMES, STATE_UNITS, physical_mobile_action
+from xyc.transport.motion import PROTOCOL, receive, send
 from test_arm_group_coordinator import FakeBus
 
 
@@ -58,24 +60,31 @@ class FakeChassis(Node):
         self.enabled = False
         self.fault = ''
         self.stops = 0
-        self.requests = {}
+        self.enable_wait_until = 0.
+        self.refuse_enable_once = False
+        self.enable_attempts = 0
         self.accepted = []
         self.lock = threading.Lock()
         self.status = self.create_publisher(String, '/robot/chassis/status', 1)
         self.commands = self.create_publisher(String, '/robot/chassis/recording_command', COMMAND_QOS)
-        self.subs = [self.create_subscription(TwistStamped, '/robot/base/cmd_vel',
-                                             lambda msg: self.on_velocity('base', msg), COMMAND_QOS),
-                     self.create_subscription(TwistStamped, '/robot/lift/cmd_vel',
-                                             lambda msg: self.on_velocity('lift', msg), COMMAND_QOS)]
+        self.subs = [self.create_subscription(MobileCommand, '/robot/mobile/command', self.on_velocity, COMMAND_QOS)]
         self.chassis_services = [self.create_service(Trigger, '/robot/chassis/' + name, callback)
                          for name, callback in [('enable', self.enable), ('stop', self.stop), ('home_lift', self.home)]]
         self.timer = self.create_timer(.03, self.publish_status)
 
     def publish_status(self):
         self.status.publish(String(data=json.dumps({'enabled': self.enabled, 'fault': self.fault,
+                            'enable_ready': time.monotonic() >= self.enable_wait_until,
+                            'enable_wait_reason': '等待连续0.15秒的完整底盘/升降静止反馈',
                             'feedback_paused': False, 'height_m': 0., 'base_measured': [0., 0., 0.], 'homing': ''})))
 
     def enable(self, _, response):
+        self.enable_attempts += 1
+        if self.refuse_enable_once:
+            self.refuse_enable_once = False
+            self.enable_wait_until = time.monotonic() + .18
+            response.message = CHASSIS_NOT_READY + '等待连续0.15秒的完整底盘/升降静止反馈'
+            return response
         self.enabled = response.success = True
         return response
 
@@ -88,22 +97,30 @@ class FakeChassis(Node):
         response.success = True
         return response
 
-    def on_velocity(self, kind, message):
+    def on_velocity(self, message):
         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
         with self.lock:
-            self.requests[kind] = stamp, message
-            if len(self.requests) != 2 or self.requests['base'][0] != self.requests['lift'][0]:
+            if self.get_clock().now().nanoseconds >= message.expires_at.sec * 10**9 + message.expires_at.nanosec:
                 return
-            base, lift = self.requests['base'][1], self.requests['lift'][1]
-            values = [lift.twist.linear.z, base.twist.linear.x, base.twist.linear.y, base.twist.angular.z]
+            values = physical_mobile_action(message.commands)
             self.accepted.append(values)
-            self.commands.publish(String(data=json.dumps({'sequence': stamp, 'targets': values})))
+            targets = [int(value) for value in message.commands]
+            self.commands.publish(String(data=json.dumps({'sequence': stamp, 'targets': targets})))
 
 
 @unittest.skipUnless(os.environ.get('XYC_ISOLATED_TEST') == '1' and os.environ.get('ROS_DOMAIN_ID') == '183',
                      'requires isolated ROS domain 183; never run against robot nodes')
 class TestReplayROS(unittest.TestCase):
     def test_source_owned_stream_acceptance_and_disconnect_stop(self):
+        self.run_source('replay')
+
+    def test_policy_uses_the_same_streaming_arm_and_mobile_controllers(self):
+        self.run_source('policy')
+
+    def test_policy_waits_for_post_hold_stationary_feedback(self):
+        self.run_source('policy', wait_after_hold=True)
+
+    def run_source(self, source, wait_after_hold=False):
         rclpy.init()
         nodes, thread, executor, connection = [], None, None, None
         replay = None
@@ -113,9 +130,11 @@ class TestReplayROS(unittest.TestCase):
             elbow = left.arm_transaction.group.controls[elbow_name]
             left.motors[elbow_name].position = denormalize_tick(elbow.entry, 97.80018)
             chassis = FakeChassis()
+            chassis.refuse_enable_once = wait_after_hold
             coordinator = ArmGroupCoordinator(parameter_overrides=[
-                Parameter('command_source', value='replay'), Parameter('streaming_targets', value=True)])
-            replay = MotionReplay(parameter_overrides=[Parameter('port', value=0)])
+                Parameter('command_source', value=source)])
+            replay = MotionReplay(parameter_overrides=[Parameter('port', value=0),
+                                                       Parameter('command_source', value=source)])
             nodes = [left, right, chassis, coordinator, replay]
             executor = MultiThreadedExecutor(num_threads=8)
             for node in nodes: executor.add_node(node)
@@ -130,16 +149,22 @@ class TestReplayROS(unittest.TestCase):
             sequence = 0
             def call(operation, **values):
                 nonlocal sequence
+                if operation == 'target':
+                    values.setdefault('valid_for_s', .25)
                 sequence += 1
                 send(channel, {'sequence': sequence, 'operation': operation, **values})
                 response = receive(channel)
                 self.assertTrue(response['accepted'], response.get('message'))
                 return response['snapshot']
             state = call('status')
+            self.assertGreater(state['source_time_ns'], 0)
+            self.assertEqual(set(state['observation_samples']), {'left', 'right'})
+            self.assertGreater(state['observation_samples']['left']['stamp_ns'], 0)
             call('prepare', protocol=PROTOCOL, calibration_ids=state['calibration_ids'],
                  action_names=list(ACTION_NAMES), action_units=list(ACTION_UNITS),
                  state_names=list(STATE_NAMES), state_units=list(STATE_UNITS))
             call('start')
+            self.assertEqual(chassis.enable_attempts, 2 if wait_after_hold else 1)
             deadline = time.monotonic() + 2.
             while not replay.snapshot()['chassis'].get('enabled') and time.monotonic() < deadline:
                 call('heartbeat')
@@ -189,3 +214,108 @@ class TestReplayROS(unittest.TestCase):
             if thread is not None: thread.join(3.)
             for node in reversed(nodes): node.destroy_node()
             rclpy.shutdown()
+
+
+class TestMobileEnableWait(unittest.TestCase):
+    def test_only_prewrite_wait_rejections_are_retried(self):
+        ready = {'ready': True, 'calibration_ids': ['left', 'right'], 'chassis': {'enable_ready': True}}
+        trigger = Mock(side_effect=[RuntimeError(CHASSIS_NOT_READY + 'waiting'), None])
+        node = SimpleNamespace(snapshot=lambda: ready, mobile_services={'enable': 'service'}, _trigger=trigger)
+        MotionReplay._enable_mobile(node, ['left', 'right'])
+        self.assertEqual(trigger.call_count, 2)
+
+    def test_hardware_error_is_not_retried(self):
+        ready = {'ready': True, 'calibration_ids': ['left', 'right'], 'chassis': {'enable_ready': True}}
+        trigger = Mock(side_effect=RuntimeError('ID 8 register write outcome unknown'))
+        node = SimpleNamespace(snapshot=lambda: ready, mobile_services={'enable': 'service'}, _trigger=trigger)
+        with self.assertRaisesRegex(RuntimeError, 'ID 8'):
+            MotionReplay._enable_mobile(node, ['left', 'right'])
+        self.assertEqual(trigger.call_count, 1)
+
+
+class TestTargetDeadline(unittest.TestCase):
+    """Use the production backend methods without creating ROS nodes or motors."""
+
+    def make_node(self, *, arm_delay=0., snapshot_delay=0., acceptance_delay=0.):
+        clock = [10.]
+        generated = SimpleNamespace(sec=100, nanosec=0)
+        node = SimpleNamespace(closing=threading.Event(), accepted_mobile={}, last_mobile=[0.] * 4)
+        node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: generated))
+        def snapshot():
+            clock[0] += snapshot_delay
+            return {'ready': True, 'state': [0.] * 18, 'chassis': {'enabled': True}}
+        node.snapshot = snapshot
+        def arms(*args, **kwargs): clock[0] += arm_delay
+        node._set_arms = Mock(side_effect=arms)
+        def publish(values, **kwargs):
+            if not acceptance_delay:
+                node.accepted_mobile[1] = {'targets': list(values)}
+            return 1
+        node._publish_mobile = Mock(side_effect=publish)
+        class Condition:
+            def __enter__(self): pass
+            def __exit__(self, *args): pass
+            def wait(self, timeout):
+                clock[0] += acceptance_delay
+                node.accepted_mobile[1] = {'targets': [1, 1, 0, 0]}
+        node.condition = Condition()
+        return node, clock, generated
+
+    def test_expired_arm_confirmation_never_dispatches_mobile_targets(self):
+        node, clock, _ = self.make_node(arm_delay=.4)
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'before base/lift dispatch'):
+                MotionReplay.target(node, [0.] * 14 + [1., 1., 0., 0.], ['l', 'r'], valid_for_s=.25)
+        node._publish_mobile.assert_not_called()
+        self.assertEqual(node.last_mobile, [0.] * 4)
+        self.assertEqual(node._set_arms.call_count, 1)
+
+    def test_expiry_during_readiness_check_prevents_all_dispatch(self):
+        node, clock, _ = self.make_node(snapshot_delay=.4)
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'before arm dispatch'):
+                MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        node._set_arms.assert_not_called()
+        node._publish_mobile.assert_not_called()
+
+    def test_live_target_preserves_generation_stamp_and_the_shared_deadline(self):
+        node, clock, generated = self.make_node(arm_delay=.1)
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            MotionReplay.target(node, [0.] * 14 + [1., 1., 0., 0.], ['l', 'r'], valid_for_s=.25)
+        self.assertEqual(node._set_arms.call_args.kwargs,
+                         {'valid_for_s': .25, 'stamp': generated, 'deadline': 10.25})
+        self.assertEqual(node._publish_mobile.call_args.kwargs, {'stamp': generated, 'expires_ns': 100_250_000_000})
+        self.assertEqual(node.last_mobile, [1., 1., 0., 0.])
+
+    def test_delayed_mobile_confirmation_cannot_restart_the_validity_window(self):
+        node, clock, _ = self.make_node(arm_delay=.15, acceptance_delay=.15)
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'before base/lift confirmation'):
+                MotionReplay.target(node, [0.] * 14 + [1., 1., 0., 0.], ['l', 'r'], valid_for_s=.25)
+        self.assertEqual(node.last_mobile, [0.] * 4)
+
+    def test_service_wait_cannot_dispatch_a_request_after_its_deadline(self):
+        node, clock, _ = self.make_node()
+        client = Mock()
+        def wait(**kwargs):
+            clock[0] += .4
+            return True
+        client.wait_for_service.side_effect = wait
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'before dispatch'):
+                MotionReplay._call(node, client, object(), timeout=.6, deadline=10.25)
+        client.call_async.assert_not_called()
+
+    def test_late_ros_reply_is_not_treated_as_fresh_acceptance(self):
+        node, clock, _ = self.make_node()
+        client, future = Mock(), Mock()
+        future.done.return_value = True
+        def dispatch(request):
+            clock[0] += .4
+            return future
+        client.call_async.side_effect = dispatch
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, 'outcome unknown'):
+                MotionReplay._call(node, client, object(), timeout=.6, deadline=10.25)
+        client.remove_pending_request.assert_called_once_with(future)
+        future.result.assert_not_called()

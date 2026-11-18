@@ -19,29 +19,22 @@ from std_msgs.msg import String
 from xyc_interfaces.msg import ArmState
 from xyc_interfaces.srv import ArmBusTransaction, SetArmTargets
 
-from xyc_hardware.arm_calibration import arm_names
-from xyc_hardware.teleop_transport import TARGET_COMMAND_EXPIRED, TELEOP_TARGET_DROPPED
+from xyc.robot.calibration import arm_names
+from xyc.transport.teleop import TARGET_COMMAND_EXPIRED, TELEOP_TARGET_DROPPED
 
 
 class ArmTargetExpired(ValueError):
     pass
 
 
-class BusResponseTimeout(RuntimeError):
-    pass
-
-
 class ArmGroupCoordinator(Node):
     def __init__(self, **kwargs):
         super().__init__('arm_group_coordinator', **kwargs)
-        self.declare_parameter('command_source', 'keyboard')
+        self.declare_parameter('command_source', 'teleop')
         self.declare_parameter('auto_hold', False)
-        self.streaming_targets = self.declare_parameter('streaming_targets', False).value
         self.source = self.get_parameter('command_source').value
-        if not isinstance(self.source, str) or not self.source.strip():
-            raise ValueError('Set a nonempty command_source')
-        if self.streaming_targets and self.source not in ('teleop', 'replay', 'policy'):
-            raise ValueError('Streaming targets require a teleop or replay command owner')
+        if self.source not in ('teleop', 'replay', 'policy'):
+            raise ValueError('command_source must be teleop, replay or policy')
         self.callbacks = ReentrantCallbackGroup()
         self.mutex = threading.Lock()
         self.bus_workers = ThreadPoolExecutor(max_workers=2)
@@ -136,7 +129,7 @@ class ArmGroupCoordinator(Node):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 client.remove_pending_request(future)
-                raise BusResponseTimeout(f'{side}: {operation} response timed out; outcome unknown')
+                raise TimeoutError(f'{side}: {operation} response timed out; outcome unknown')
             time.sleep(min(remaining, .001))
         result = future.result()
         if result is None or not result.success:
@@ -193,7 +186,7 @@ class ArmGroupCoordinator(Node):
                 prepared.append(side)
             committing = True  # A lost response can conceal an enable.
             for side in ('left', 'right'):
-                self.call_bus(side, 'commit', token)
+                self.call_bus(side, 'commit_hold', token)
             self.phase = 'holding'
             response.success = True
             response.message = 'Both buses reported holding; hardware writes were sequential'
@@ -244,7 +237,6 @@ class ArmGroupCoordinator(Node):
         if not self.mutex.acquire(blocking=False):
             response.message = 'Another arm transaction is in progress'
             return response
-        prepared = []
         committing = False
         started = time.monotonic()
         sent_ns = None
@@ -254,57 +246,26 @@ class ArmGroupCoordinator(Node):
             targets = tuple(request.position_normalized)
             expires_ns = (request.header.stamp.sec * 1_000_000_000 + request.header.stamp.nanosec
                           + request.valid_for.sec * 1_000_000_000 + request.valid_for.nanosec)
-            # Each preparation only reads its own serial bus. Join both before
-            # committing either so a peer rejection can still abort cleanly.
+            self.check_command_time(request)
+            sent_ns = self.get_clock().now().nanoseconds
+            committing = True  # Either independent bus may have started writing.
             failures = []
-            pending = {
-                side: self.bus_workers.submit(self.call_bus, side, 'prepare_targets', token,
-                                              targets[i * 7:(i + 1) * 7], expires_ns=expires_ns)
-                for i, side in enumerate(('left', 'right')) if not self.streaming_targets
-            }
-            for side, task in pending.items():
+            writes = [self.bus_workers.submit(
+                self.call_bus, side, 'stream_targets', token,
+                targets=targets[i * 7:(i + 1) * 7], expires_ns=expires_ns)
+                for i, side in enumerate(('left', 'right'))]
+            for task in writes:
                 try:
                     task.result()
                 except Exception as exc:
                     failures.append(exc)
-                else:
-                    prepared.append(side)
             if failures:
-                if (all(isinstance(exc, (ArmTargetExpired, BusResponseTimeout)) for exc in failures)
-                        and self.get_clock().now().nanoseconds >= expires_ns):
+                if all(isinstance(exc, ArmTargetExpired) for exc in failures):
+                    # All buses replied: each accepted or confirmed expiry
+                    # before writing. Keep held goals; publish no partial event.
+                    committing = False
                     raise ArmTargetExpired('; '.join(map(str, failures)))
                 raise RuntimeError('; '.join(map(str, failures)))
-            if self.source in ('teleop', 'replay'):
-                self.check_command_time(request)
-                sent_ns = self.get_clock().now().nanoseconds
-                committing = True  # Either independent bus may have started writing.
-                operation = 'stream_targets' if self.streaming_targets else 'commit'
-                commits = [self.bus_workers.submit(
-                    self.call_bus, side, operation, token,
-                    targets=targets[i * 7:(i + 1) * 7] if self.streaming_targets else None,
-                    expires_ns=expires_ns) for i, side in enumerate(('left', 'right'))]
-                for task in commits:
-                    try:
-                        task.result()
-                    except Exception as exc:
-                        failures.append(exc)
-                if failures:
-                    if ((self.streaming_targets or len(failures) == len(commits))
-                            and all(isinstance(exc, ArmTargetExpired) for exc in failures)):
-                        # Every bus replied: each either accepted the stream
-                        # target or confirmed expiry BEFORE writing. Keep the
-                        # existing goals and replan, without publishing a full
-                        # 14-D command event for this incomplete group.
-                        committing = False
-                        raise ArmTargetExpired('; '.join(map(str, failures)))
-                    raise RuntimeError('; '.join(map(str, failures)))
-            else:
-                for side in ('left', 'right'):
-                    self.check_command_time(request)
-                    if sent_ns is None:
-                        sent_ns = self.get_clock().now().nanoseconds
-                    committing = True
-                    self.call_bus(side, 'commit', token, expires_ns=expires_ns)
             response.accepted = True
             response.message = 'Both buses accepted targets; check feedback for arrival'
             try:
@@ -322,9 +283,7 @@ class ArmGroupCoordinator(Node):
                 self.phase = 'fault'
                 errors = self.protective_release()
             else:
-                errors = self.abort_prepared(prepared, token if prepared else 0)
-                if errors:
-                    self.phase = 'fault'
+                errors = []  # Validation failed before any bus write.
             response.message = str(exc) + ('; cleanup unconfirmed: ' + '; '.join(errors) if errors else '')
             if self.source == 'teleop':
                 self.get_logger().warning(f'Arm target rejected: {response.message}')

@@ -19,14 +19,15 @@ from std_msgs.msg import String
 
 from xyc_interfaces.msg import ArmState, MotorFeedback, MotorFeedbackArray
 from xyc_interfaces.srv import ArmBusTransaction as ArmBusTransactionSrv
-from xyc_hardware.arm_calibration import FEEDBACK_ENDPOINT_TOLERANCE_TICKS, arm_names, normalize_tick
+from xyc.robot.calibration import FEEDBACK_ENDPOINT_TOLERANCE_TICKS, arm_names, normalize_tick
 from xyc_hardware.arm_state import ArmStateConverter
-from xyc_hardware.feetech_reader import FeetechReader, MODEL_NAMES, decode_feedback
+from xyc.robot.feetech import FeetechReader, MODEL_NAMES, decode_feedback
 from xyc_hardware.arm_joint_control import (
     GRIPPER_TORQUE_LIMIT_RAW_DEFAULT, ArmBusHold, ArmBusTransaction,
     BoundJointDriver, JointControl, JointDriver,
 )
-from xyc_hardware.teleop_transport import TARGET_COMMAND_EXPIRED
+from xyc_hardware.chassis_control import ChassisDriver, ChassisRos, TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC
+from xyc.transport.teleop import TARGET_COMMAND_EXPIRED
 
 
 class MotorStateNode(Node):
@@ -38,7 +39,6 @@ class MotorStateNode(Node):
         self.recording_publisher = self.create_publisher(String, 'recording_sample', qos_profile_sensor_data)
         self.joint_controls = {}
         self.group_mode = False
-        self.streaming_targets_enabled = False
         self.arm_transaction = None
         self.group_session_id = ''
         self.chassis = None
@@ -54,6 +54,9 @@ class MotorStateNode(Node):
             self.declare_parameter('calibration_file', '')
             self.declare_parameter('group_mode', False, ParameterDescriptor(read_only=True))
             self.declare_parameter('chassis_mode', False, ParameterDescriptor(read_only=True))
+            command_source = self.declare_parameter(
+                'command_source', 'teleop', ParameterDescriptor(read_only=True),
+            ).value
             self.declare_parameter('gripper_torque_limit_raw', GRIPPER_TORQUE_LIMIT_RAW_DEFAULT,
                                    ParameterDescriptor(read_only=True))
             self.declare_parameter('motor_ids', Parameter.Type.INTEGER_ARRAY)
@@ -78,7 +81,6 @@ class MotorStateNode(Node):
             if chassis_mode and self.bus != 'left':
                 raise ValueError('Chassis control belongs to the left bus')
             self.group_mode = group_mode
-            self.streaming_targets_enabled = group_mode
             if group_mode and not value('calibration_file'):
                 raise ValueError('Group control requires an arm calibration file')
             if not port or self.bus not in ('left', 'right'):
@@ -97,7 +99,6 @@ class MotorStateNode(Node):
             reader_class = JointDriver if group_mode else FeetechReader
             control_options = {'bus': self.bus, 'joint_id': 6} if group_mode else {}
             if chassis_mode:
-                from xyc_hardware.chassis_control import ChassisDriver
                 reader_class = ChassisDriver
                 control_options = {'bus': self.bus, 'joint_id': 6}
             self.reader = reader_class(
@@ -175,9 +176,10 @@ class MotorStateNode(Node):
                     self.torque_status_service = self.create_service(Trigger, 'joint/torque_status', self.read_torque_status)
                     self.get_logger().info('Seven-joint group ready; waiting for an explicit hold request')
             if chassis_mode:
-                from xyc_hardware.chassis_control import ChassisRos
                 self.chassis = ChassisRos(self, self.reader)
                 self.get_logger().info('底盘/升降接口就绪；等待电脑遥操连接后自动准备')
+            if command_source == 'teleop' and (group_mode or chassis_mode):
+                self.create_subscription(String, TELEOP_FAULT_TOPIC, self.on_teleop_fault, TELEOP_FAULT_QOS)
             self.publisher = self.create_publisher(
                 MotorFeedbackArray, 'feedback', qos_profile_sensor_data,
             )
@@ -361,16 +363,9 @@ class MotorStateNode(Node):
                 raise ValueError('Bus session changed; transaction rejected')
             elif request.operation == 'prepare_hold':
                 transaction.prepare_hold(token)
-            elif request.operation == 'prepare_targets':
-                deadline = self.command_deadline(request.expires_at)
-                transaction.prepare_targets(token, request.targets, deadline=deadline)
-            elif request.operation == 'commit':
-                target_commit = transaction.pending and transaction.pending[0] == 'targets'
-                deadline = self.command_deadline(request.expires_at) if target_commit else None
-                transaction.commit(token, deadline=deadline)
+            elif request.operation == 'commit_hold':
+                transaction.commit_hold(token)
             elif request.operation == 'stream_targets':
-                if not self.streaming_targets_enabled:
-                    raise ValueError('Streaming targets require calibrated group control')
                 deadline = self.command_deadline(request.expires_at)
                 transaction.apply_stream_targets(token, request.targets, deadline=deadline)
             elif request.operation == 'abort':
@@ -398,15 +393,22 @@ class MotorStateNode(Node):
             raise ValueError('Target command has an invalid lifetime')
         return started + remaining
 
-    def release_owned_joints(self):
-        controls = self.joint_controls.items()
-        for name, controller in list(controls):
-            if not controller.owned:
-                continue
-            try:
-                controller.release()
-            except (OSError, ValueError, RuntimeError) as exc:
-                self.get_logger().error(f'退出时 {name} 未确认脱力：{exc}')
+    def on_teleop_fault(self, message):
+        if not message.data:
+            return
+        try:
+            if self.chassis is not None:
+                self.chassis.on_teleop_fault(message)
+        finally:
+            self.stop_arm(message.data)
+
+    def stop_arm(self, reason):
+        if self.arm_transaction is None:
+            return
+        try:
+            self.arm_transaction.protective_release(reason)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.get_logger().error(f'{self.bus} 手臂保护停车未确认：{exc}')
 
     def destroy_node(self):
         try:
@@ -414,7 +416,7 @@ class MotorStateNode(Node):
                 if self.chassis is not None:
                     self.chassis.close()
             finally:
-                self.release_owned_joints()
+                self.stop_arm('Motor node shutdown')
         finally:
             try:
                 if self.reader is not None:

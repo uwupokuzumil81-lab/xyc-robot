@@ -1,5 +1,5 @@
-# Internal seven-joint bus transaction. A coordinator must prepare both arms
-# before committing either; commits and hardware writes are not atomic.
+# Internal seven-joint bus control. Startup uses prepare_hold/commit_hold.
+# Continuous targets use stream_targets, one batch per bus; writes are not atomic.
 string operation
 string session_id
 uint64 token

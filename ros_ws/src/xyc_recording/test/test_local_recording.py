@@ -14,14 +14,13 @@ import av
 import pyarrow.parquet as pq
 
 from test_recording import capture
-from xyc_recording.local_recorder import LocalDatasetReceiver
-from xyc_recording.cache import CachedDesktopWriter
-from xyc_recording.stream import (
+from xyc.recording.local_recorder import LocalDatasetReceiver
+from xyc.recording.cache import CachedDesktopWriter
+from xyc.recording.stream import (
     CaptureRelay, RecordingBackpressure, RelayServer, pack_event, unpack_event,
 )
-from xyc_recording.alignment import (
-    ACTION_SEMANTICS, ACTION_UNITS, RECORDING_CONTRACT, STATE_UNITS,
-)
+from xyc.contracts import ACTION_SEMANTICS, ACTION_UNITS, STATE_UNITS
+from xyc.recording.alignment import RECORDING_CONTRACT
 
 
 def robot_assets():
@@ -242,3 +241,40 @@ class TestLocalRecording(unittest.TestCase):
         self.writer.save()
         self.assertEqual(self.writer.info['total_frames'], 3)
         self.assertEqual(self.writer.info['total_episodes'], 1)
+
+
+class TestRetryInterruptedDesktopCommit(unittest.TestCase):
+    def test_same_receiver_retries_and_deduplicates_a_commit(self):
+        from xyc.recording import writer as module
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'dataset': 'xyc/retry', 'task': 'test', 'resume': True}
+            receiver = LocalDatasetReceiver(directory, config, width=16, height=16)
+            assets = {'recording_contract': RECORDING_CONTRACT, 'action_semantics': ACTION_SEMANTICS,
+                      'state_units': list(STATE_UNITS), 'action_units': list(ACTION_UNITS)}
+            def event(operation, payload=None):
+                return receiver.handle({'operation': operation, 'payload': payload or {}})
+            opened = {'config': config, 'robot_assets': assets}
+            cache_id = 'c' * 32
+            event('open', opened)
+            try:
+                event('begin', {'cache_id': cache_id})
+                for i in range(2): receiver.handle({'operation': 'capture', 'payload': {}, 'capture': capture(i)})
+                payload = {'cache_id': cache_id, 'frames': 2, 'sha256': receiver.capture_digest.hexdigest()}
+                original = module.os.replace
+                def interrupted(source, target):
+                    if Path(target) == receiver.writer.root / 'meta/stats.json':
+                        raise OSError('injected interruption')
+                    return original(source, target)
+                with patch.object(module.os, 'replace', side_effect=interrupted):
+                    with self.assertRaises(OSError): event('save', payload)
+                event('open', opened)
+                event('begin', {'cache_id': cache_id})
+                for i in range(2): receiver.handle({'operation': 'capture', 'payload': {}, 'capture': capture(i)})
+                self.assertEqual(event('save', payload)['frames'], 2)
+                self.assertTrue(event('begin', {'cache_id': cache_id})['committed'])
+                self.assertEqual(receiver.writer.info['total_episodes'], 1)
+                event('begin', {'cache_id': 'd' * 32})
+                self.assertIsNotNone(receiver.writer.stage)
+                receiver.writer.discard()
+            finally:
+                receiver.writer.close()

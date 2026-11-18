@@ -1,3 +1,4 @@
+from xyc.robot.profile import robot_profile
 # SPDX-License-Identifier: Apache-2.0
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable, Shutdown
@@ -11,9 +12,8 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def acquire_backend(context):
-    from pathlib import Path
-    from xyc_hardware.teleop_transport import BackendLease
-    lease = BackendLease(Path.home() / 'pi05_from_zero')
+    from xyc.transport.lease import BackendLease
+    lease = BackendLease(robot_profile().robot_root)
     lease.acquire(**{name: LaunchConfiguration(name).perform(context) == 'true'
                      for name in ('with_motors', 'with_cameras', 'recording')})
     context.register_event_handler(OnShutdown(on_shutdown=[

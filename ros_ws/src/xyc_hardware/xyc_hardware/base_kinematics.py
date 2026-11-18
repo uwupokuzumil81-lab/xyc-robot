@@ -77,3 +77,14 @@ class OmniGeometry:
             raise ValueError('Provide three wheel velocities in configured order')
         measured = tuple(_number(value, 'wheel velocity') for value in wheel_rad_s)
         return _solve(self.matrix(), measured)
+
+    def constrain_body_velocity(self, x_m_s, y_m_s, yaw_rad_s):
+        """Preserve body direction/rotation ratios when a combined goal saturates."""
+        self.validate()
+        body = tuple(_number(value, 'body velocity') for value in (x_m_s, y_m_s, yaw_rad_s))
+        peak = max(abs(sum(a * b for a, b in zip(row, body))) for row in self.matrix())
+        scale = min(1., self.max_wheel_rad_s / peak) if peak else 1.
+        # Keep floating-point reconstruction just inside the verified wheel limit.
+        if scale < 1.:
+            scale *= 1. - 1e-12
+        return tuple(value * scale for value in body)

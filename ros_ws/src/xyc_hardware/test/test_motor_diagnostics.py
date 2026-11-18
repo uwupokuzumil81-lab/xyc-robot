@@ -6,9 +6,10 @@ import unittest
 from unittest.mock import MagicMock
 
 import rclpy
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from xyc_hardware.arm_calibration import arm_names
+from xyc.robot.calibration import arm_names
 from xyc_hardware.arm_joint_control import BoundJointDriver
 from xyc_hardware.motor_state_node import MotorStateNode
 from test_arm_calibration import fixture
@@ -81,16 +82,25 @@ class TestMotorDiagnostics(unittest.TestCase):
         self.assertEqual(status['fault'], 'overcurrent')
         self.assertFalse(status['owned'])
 
-    def test_shutdown_attempts_every_owned_joint_even_when_one_release_fails(self):
-        controls = {name: MagicMock(owned=True) for name in arm_names('right')}
-        controls['arm_right_wrist_roll'].release.side_effect = OSError('unconfirmed release')
+    def test_motor_owner_reports_unconfirmed_protective_stop(self):
         logger = MagicMock()
-        self.owner.joint_controls = controls
         self.owner.get_logger = lambda: logger
-        MotorStateNode.release_owned_joints(self.owner)
-        for control in controls.values():
-            control.release.assert_called_once()
+        release = MagicMock(side_effect=OSError('unconfirmed release'))
+        self.owner.arm_transaction = SimpleNamespace(protective_release=release)
+        MotorStateNode.stop_arm(self.owner, 'Motor node shutdown')
+        release.assert_called_once_with('Motor node shutdown')
         logger.error.assert_called_once()
+        self.assertIn('unconfirmed release', logger.error.call_args.args[0])
+
+    def test_teleop_fault_stops_arm_even_when_chassis_stop_raises(self):
+        error = OSError('lost zero-speed write')
+        self.owner.chassis = MagicMock()
+        self.owner.chassis.on_teleop_fault.side_effect = error
+        self.owner.stop_arm = MagicMock()
+        fault = String(data='遥操已停止：test fault')
+        with self.assertRaisesRegex(OSError, 'lost zero-speed write'):
+            MotorStateNode.on_teleop_fault(self.owner, fault)
+        self.owner.stop_arm.assert_called_once_with(fault.data)
 
     def test_alternating_log_levels_do_not_crash_the_node(self):
         owns_context = not rclpy.ok()

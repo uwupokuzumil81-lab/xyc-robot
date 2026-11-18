@@ -9,44 +9,35 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from xyc_camera.preview_node import CAMERAS, CameraPreview, FrameHub, PreviewServer
+from xyc_camera.preview_node import CameraPreview, CAMERAS, FrameHub, PreviewServer
 
 
 JPEG = b'\xff\xd8synthetic-jpeg\xff\xd9'
 
 
 class TestPreviewCadence(unittest.TestCase):
-    def test_near_thirty_hz_capture_jitter_does_not_halve_preview_rate(self):
+    def test_compressed_acquisition_keeps_every_frame_independent_of_browser_rate(self):
         from xyc_camera.camera_node import CameraNode
-        for rate, bounds in ((30., (98, 100)), (15., (49, 52))):
-            with self.subTest(rate=rate):
-                frame = object()
-                message = SimpleNamespace(header=SimpleNamespace())
-                camera = SimpleNamespace(
-                    camera=MagicMock(), bridge=MagicMock(), publisher=MagicMock(),
-                    preview_publisher=MagicMock(), preview_fps=rate, next_preview=0.,
-                    preview_pending=None, preview_condition=threading.Condition(),
-                    get_clock=MagicMock(), frame_id='fake_optical', preview_stopped=False,
-                )
-                camera.camera.read.return_value = (True, frame)
-                camera.bridge.cv2_to_imgmsg.return_value = message
-                camera.preview_publisher.get_subscription_count.return_value = 1
-                count = 0
-                with patch('xyc_camera.camera_node.rclpy.ok', return_value=True):
-                    for i in range(100):
-                        camera.preview_pending = None
-                        now = 10. + i / 29.5 + (.001 if i % 2 else -.001)
-                        with patch('xyc_camera.camera_node.time.monotonic', return_value=now):
-                            CameraNode.publish_frame(camera)
-                        count += camera.preview_pending is not None
-                self.assertGreaterEqual(count, bounds[0])
-                self.assertLessEqual(count, bounds[1])
-                self.assertEqual(camera.publisher.publish.call_count, 100)
+        message = SimpleNamespace(header=SimpleNamespace())
+        camera = SimpleNamespace(
+            camera=MagicMock(), bridge=MagicMock(), publisher=MagicMock(),
+            compressed_publisher=MagicMock(), encode_pending=None,
+            encode_condition=threading.Condition(), get_clock=MagicMock(),
+            frame_id='fake_optical', encode_stopped=False)
+        camera.camera.read.return_value = (True, object())
+        camera.bridge.cv2_to_imgmsg.return_value = message
+        camera.compressed_publisher.get_subscription_count.return_value = 1
+        with patch('xyc_camera.camera_node.rclpy.ok', return_value=True):
+            for _ in range(100):
+                camera.encode_pending = None
+                CameraNode.publish_frame(camera)
+                self.assertIsNotNone(camera.encode_pending)
+        self.assertEqual(camera.publisher.publish.call_count, 100)
 
     def test_shutdown_during_blocking_camera_read_is_not_a_capture_failure(self):
         from xyc_camera.camera_node import CameraNode
         camera = SimpleNamespace(
-            camera=MagicMock(), publisher=MagicMock(), preview_stopped=False,
+            camera=MagicMock(), publisher=MagicMock(), encode_stopped=False,
         )
         camera.camera.read.return_value = (False, None)
         with patch('xyc_camera.camera_node.rclpy.ok', return_value=False):
@@ -68,12 +59,8 @@ class TestFrameHub(unittest.TestCase):
         self.assertFalse(hub.status()['forward']['live'])
         self.assertEqual(len(hub.frames), 1)
 
-    def test_watcher_counts_and_close_release_waiters(self):
+    def test_close_releases_waiters(self):
         hub = FrameHub()
-        hub.watch('forward', 1)
-        self.assertEqual(hub.watched(), {'forward'})
-        hub.watch('forward', -1)
-        self.assertEqual(hub.watched(), set())
         hub.close()
         self.assertIsNone(hub.wait('forward', 0, timeout=.01))
 
@@ -143,7 +130,7 @@ class TestPreviewHTTP(unittest.TestCase):
         self.assertEqual(response.read(length), JPEG)
 
     def test_recording_uses_existing_preview_port_and_preserves_binary_packets(self):
-        from xyc_recording.stream import CaptureRelay, RelayServer, pack_event
+        from xyc.recording.stream import CaptureRelay, RelayServer
         relay = CaptureRelay()
         upstream = RelayServer(('127.0.0.1', 0), relay)
         worker = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -237,27 +224,33 @@ class TestPreviewROS(unittest.TestCase):
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage, Image
         from xyc_camera.camera_node import CameraNode
+
         class FakeCamera:
             def isOpened(self):
                 return True
-            def set(self, *_):
+
+            def set(self, *_):  # noqa: A003 - OpenCV VideoCapture API
                 return True
+
             def read(self):
                 return True, np.full((30, 40, 3), 100, dtype=np.uint8)
+
             def release(self):
                 pass
         parameters = [Parameter('device', value='/fake/camera'),
                       Parameter('frame_id', value='fake_optical'),
                       Parameter('width', value=40), Parameter('height', value=30)]
         with patch('xyc_camera.camera_node.cv2.VideoCapture', return_value=FakeCamera()):
-            camera = self.add(CameraNode(namespace='/camera/synthetic', parameter_overrides=parameters))
+            self.add(CameraNode(namespace='/camera/synthetic', parameter_overrides=parameters))
         sink = self.add(Node('fake_image_observer'))
         raw, compressed = [], []
-        sink.create_subscription(Image, '/camera/synthetic/image_raw', raw.append, qos_profile_sensor_data)
+        sink.create_subscription(
+            Image, '/camera/synthetic/image_raw', raw.append, qos_profile_sensor_data)
         sink.create_subscription(CompressedImage, '/camera/synthetic/image_raw/compressed',
                                  compressed.append, qos_profile_sensor_data)
         self.spin_until(lambda: raw and compressed)
-        decoded = cv2.imdecode(np.frombuffer(bytes(compressed[-1].data), dtype=np.uint8), cv2.IMREAD_COLOR)
+        decoded = cv2.imdecode(
+            np.frombuffer(bytes(compressed[-1].data), dtype=np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(decoded.shape, (30, 40, 3))
         self.assertEqual(raw[-1].encoding, 'bgr8')
         self.assertEqual(raw[-1].header.frame_id, 'fake_optical')

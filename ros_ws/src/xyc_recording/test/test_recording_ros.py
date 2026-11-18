@@ -24,9 +24,9 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from xyc_hardware.recording_bridge import RecordingBridge
-from xyc_recording.alignment import ARM_NAMES, CAMERAS
+from xyc.contracts import ARM_NAMES, CAMERAS
 from xyc_recording.recorder_node import RecorderNode
-from xyc_recording.local_recorder import LocalDatasetReceiver
+from xyc.recording.local_recorder import LocalDatasetReceiver
 
 
 class TestRecordingSessions(unittest.TestCase):
@@ -139,7 +139,7 @@ class TestROSRecording(unittest.TestCase):
                          'calibration_ids': ids, 'sessions': ['left-synthetic', 'right-synthetic']}
                 command_pubs[0].publish(String(data=json.dumps(event)))
                 if ticks % 2 == 0:
-                    event.update(kind='mobile', targets=[.015, .15, 0., .60], session='left-synthetic')
+                    event.update(kind='mobile', targets=[1, 1, 0, 1], session='left-synthetic')
                     command_pubs[1].publish(String(data=json.dumps(event)))
 
             timer = source.create_timer(1 / 60, publish)

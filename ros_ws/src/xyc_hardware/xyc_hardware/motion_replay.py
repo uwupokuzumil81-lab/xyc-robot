@@ -8,19 +8,19 @@ import threading
 import time
 
 import rclpy
-from geometry_msgs.msg import TwistStamped
 from rcl_interfaces.srv import GetParameters
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from xyc_interfaces.msg import ArmState
+from xyc_interfaces.msg import ArmState, MobileCommand
 from xyc_interfaces.srv import SetArmTargets
 
-from xyc_hardware.chassis_control import COMMAND_QOS
-from xyc_hardware.replay_transport import (
-    ARM_NAMES, PORT, PROTOCOL, ReplaySession, physical_mobile_action, receive, send,
+from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS, mobile_message
+from xyc.contracts import ARM_NAMES, COMMAND_VALIDITY_S, checked_mobile_action
+from xyc.transport.motion import (
+    PORT, PROTOCOL, ReplaySession, receive, send,
 )
 
 
@@ -46,8 +46,7 @@ class MotionReplay(Node):
         self.owner = self.create_client(GetParameters, '/arm_group_coordinator/get_parameters')
         self.mobile_services = {name: self.create_client(Trigger, '/robot/chassis/' + name)
                                 for name in ('enable', 'stop', 'home_lift')}
-        self.base_pub = self.create_publisher(TwistStamped, '/robot/base/cmd_vel', COMMAND_QOS)
-        self.lift_pub = self.create_publisher(TwistStamped, '/robot/lift/cmd_vel', COMMAND_QOS)
+        self.mobile_pub = self.create_publisher(MobileCommand, '/robot/mobile/command', COMMAND_QOS)
         self.state_subscriptions = [self.create_subscription(
             ArmState, f'/motors/{side}/state', lambda msg, side=side: self._arm(side, msg),
             qos_profile_sensor_data) for side in ('left', 'right')]
@@ -143,20 +142,31 @@ class MotionReplay(Node):
                     'state': [*positions, height, *velocity], 'chassis': mobile,
                     'driver_targets': driver_targets, 'driver_target_ticks': driver_target_ticks,
                     'driver_target_stamps_ns': driver_target_stamps,
+                    'observation_samples': {side: self.arm_control[side][1]
+                                            for side in ('left', 'right') if side in self.arm_control},
+                    'source_time_ns': self.get_clock().now().nanoseconds,
                     'sample_received_monotonic_s': {
                         side: self.arms[side][0] if side in self.arms else None for side in ('left', 'right')},
                     'chassis_received_monotonic_s': self.mobile[0] if self.mobile else None,
                     'feedback_monotonic_ns': time.monotonic_ns()}
 
-    def _call(self, client, request, timeout=3.):
-        if not client.wait_for_service(timeout_sec=.5):
+    def _call(self, client, request, timeout=3., *, deadline=None):
+        local_deadline = time.monotonic() + timeout
+        deadline = min(local_deadline, deadline) if deadline is not None else local_deadline
+        if deadline <= time.monotonic():
+            raise TimeoutError('ROS command deadline expired before dispatch')
+        available = client.wait_for_service(timeout_sec=min(.5, deadline - time.monotonic()))
+        if time.monotonic() >= deadline:
+            raise TimeoutError('ROS command deadline expired before dispatch')
+        if not available:
             raise RuntimeError('Required replay ROS service is unavailable')
         future = client.call_async(request)
-        deadline = time.monotonic() + timeout
-        while not future.done():
+        while True:
             if self.closing.is_set() or time.monotonic() >= deadline:
                 client.remove_pending_request(future)
                 raise TimeoutError('ROS reply timed out; command outcome unknown, not retried')
+            if future.done():
+                break
             time.sleep(.001)
         result = future.result()
         if result is None:
@@ -178,21 +188,12 @@ class MotionReplay(Node):
         current = self.snapshot()
         if not current['ready'] or ids != current['calibration_ids']:
             raise ValueError('Robot feedback/calibration changed before starting')
-        deadline = time.monotonic() + 1.5
-        while (not current['chassis'].get('enabled')
-               and current['chassis'].get('enable_ready') is False):
-            if time.monotonic() >= deadline:
-                raise ValueError(current['chassis'].get('enable_wait_reason') or 'Waiting for stationary feedback')
-            time.sleep(.01)
-            current = self.snapshot()
-            if not current['ready']:
-                raise ValueError(current['reason'])
         if self.armed:
             self._set_arms(current['state'][:14], ids)
         else:
             self._trigger(self.start_arms)
         self.armed = True
-        self._trigger(self.mobile_services['enable'])
+        self._enable_mobile(ids)
         self.last_mobile = [0., 0., 0., 0.]
         deadline = time.monotonic() + .8
         while not self.snapshot()['ready']:
@@ -200,53 +201,82 @@ class MotionReplay(Node):
                 raise RuntimeError('Arm ownership/feedback was not confirmed after startup')
             time.sleep(.005)
 
+    def _enable_mobile(self, ids):
+        # Enabling arm hold may briefly interrupt polling on the shared left
+        # bus. Rebuild the stationary window AFTER hold, rather than trusting
+        # the older status published before that transaction.
+        deadline = time.monotonic() + 3.
+        reason = 'Waiting for fresh stationary feedback after arm hold'
+        while time.monotonic() < deadline:
+            current = self.snapshot()
+            if ids != current['calibration_ids'] or current['chassis'].get('fault'):
+                raise ValueError(current.get('reason') or 'Calibration changed or chassis faulted')
+            if (not current['ready'] or current['chassis'].get('enable_ready') is False):
+                reason = current.get('reason') or current['chassis'].get('enable_wait_reason') or reason
+            else:
+                try:
+                    self._trigger(self.mobile_services['enable'])
+                    return
+                except RuntimeError as exc:
+                    # This tagged rejection is issued before any motor writes.
+                    # Register/write failures have unknown outcomes and are not retried.
+                    if not str(exc).startswith(CHASSIS_NOT_READY):
+                        raise
+                    reason = str(exc)
+            time.sleep(.01)
+        raise TimeoutError('底盘/升降启动等待超时：' + reason)
+
     def home(self):
         self._trigger(self.mobile_services['home_lift'])
         self.last_mobile = [0., 0., 0., 0.]
         self.renew()
 
-    def _set_arms(self, positions, ids):
+    def _set_arms(self, positions, ids, *, valid_for_s=COMMAND_VALIDITY_S, stamp=None, deadline=None):
         self.command_sequence += 1
         request = SetArmTargets.Request()
-        request.header.stamp = self.get_clock().now().to_msg()
+        request.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
         request.source_id = self.command_source
         request.sequence = self.command_sequence
-        request.valid_for.nanosec = 250_000_000
+        request.valid_for.nanosec = int(valid_for_s * 1e9)
         request.arm_calibration_ids = list(ids)
         request.position_normalized = list(positions)
-        reply = self._call(self.targets, request, timeout=.6)
+        reply = self._call(self.targets, request, timeout=.6, deadline=deadline)
         if not reply.accepted:
             raise RuntimeError('Arm replay target rejected: ' + reply.message)
 
-    def _publish_mobile(self, values):
-        stamp = self.get_clock().now().to_msg()
-        lift, x, y, yaw = values
-        base, vertical = TwistStamped(), TwistStamped()
-        for message in (base, vertical):
-            message.header.stamp = stamp
-            message.header.frame_id = 'base_link'
-        base.twist.linear.x, base.twist.linear.y, base.twist.angular.z = x, y, yaw
-        vertical.twist.linear.z = lift
-        self.base_pub.publish(base)
-        self.lift_pub.publish(vertical)
-        return stamp.sec * 1_000_000_000 + stamp.nanosec
+    def _publish_mobile(self, values, *, stamp=None, expires_ns=None):
+        message = mobile_message(self, values, stamp=stamp, expires_ns=expires_ns)
+        if self.get_clock().now().nanoseconds >= message.expires_at.sec * 10**9 + message.expires_at.nanosec:
+            raise TimeoutError('Mobile command expired before ROS publication')
+        self.mobile_pub.publish(message)
+        return message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
 
-    def target(self, action, ids):
+    def target(self, action, ids, *, valid_for_s):
+        deadline = time.monotonic() + valid_for_s
+        generated = self.get_clock().now().to_msg()
+        lifetime = max(0., deadline - time.monotonic())
         status = self.snapshot()
         if (not status['ready'] or not status['chassis'].get('enabled')
                 or status['chassis'].get('homing') or status['state'][14] is None):
             raise ValueError('Replay needs enabled base/lift, completed homing and fresh feedback')
-        self._set_arms(action[:14], ids)
-        mobile = physical_mobile_action(action[14:])
-        stamp = self._publish_mobile(mobile)
-        deadline = time.monotonic() + .2
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Target deadline expired before arm dispatch')
+        self._set_arms(action[:14], ids, valid_for_s=lifetime, stamp=generated, deadline=deadline)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Target deadline expired before base/lift dispatch')
+        mobile = checked_mobile_action(action[14:])
+        expires_ns = generated.sec * 10**9 + generated.nanosec + int(lifetime * 1e9)
+        stamp = self._publish_mobile(mobile, stamp=generated, expires_ns=expires_ns)
+        deadline = min(deadline, time.monotonic() + .2)
         with self.condition:
             while stamp not in self.accepted_mobile:
                 if self.closing.is_set() or time.monotonic() >= deadline:
                     raise TimeoutError('Base/lift acceptance not confirmed; stopping replay')
                 self.condition.wait(.002)
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Target deadline expired before base/lift confirmation')
             event = self.accepted_mobile[stamp]
-            if list(event['targets']) != list(mobile):
+            if event['targets'] != mobile:
                 raise RuntimeError('Base/lift accepted a different target')
         self.last_mobile = list(mobile)
 

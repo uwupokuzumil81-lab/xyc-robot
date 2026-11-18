@@ -2,7 +2,6 @@
 
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-import os
 import yaml
 
 
@@ -50,12 +49,6 @@ class TrainConfig:
         return asdict(self)
 
 
-def project_root():
-    if value := os.environ.get('XYC_PROJECT_ROOT'):
-        return Path(value).expanduser().resolve()
-    candidates = [Path(__file__).resolve().parents[3], Path.cwd(), *Path.cwd().parents]
-    return next((p for p in candidates if (p / 'pyproject.toml').is_file()
-                 and (p / 'config/train/act.yaml').is_file()), Path.cwd())
 
 
 def load_config(path):

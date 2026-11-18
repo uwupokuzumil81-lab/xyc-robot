@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Restricted position control; instantiated only by explicit configuration.
+"""Shared calibrated arm control, persistent goals and gripper contact hold.
 
-Torque and motion profiles are written to individually selected joints. Teleop
-can group position targets for arm IDs 1..7 on the same bus.
+Continuous targets use one grouped write per serial bus. Startup torque and
+profile setup, contact preload and torque release use verified per-motor writes.
 Profile layout follows Feetech's public sms_sts.WritePosEx implementation.
 """
 
@@ -14,12 +14,16 @@ import time
 
 import serial
 
-from xyc_hardware.arm_calibration import (
+from xyc.robot.calibration import (
     FEEDBACK_ENDPOINT_TOLERANCE_TICKS, arm_names, denormalize_tick, integer, normalize_tick,
     position_target_tick,
 )
-from xyc_hardware.feetech_reader import FeetechReader, decode_feedback, signed_magnitude
-from xyc_hardware.teleop_transport import TARGET_COMMAND_EXPIRED
+from xyc.robot.feetech import FeetechReader, decode_feedback, signed_magnitude
+from xyc.transport.teleop import TARGET_COMMAND_EXPIRED
+from xyc.contracts import CommandExpired
+from xyc_hardware.motor_safety import (
+    CurrentProtection, FEEDBACK_LOSS_GRACE_S, MOTOR_TEMPERATURE_LIMIT_C, confirm_temperature,
+)
 
 
 ARM_ACCEL_RAW = 120
@@ -30,10 +34,6 @@ ARRIVAL_WARNING_S = 3.0
 HOLD_WARNING_TICKS = 30
 HOLD_RECOVERY_TICKS = 10
 HOLD_WARNING_SAMPLES = 3
-MOTOR_TEMPERATURE_LIMIT_C = 55
-TEMPERATURE_RECHECK_CLEAR_C = 52
-TEMPERATURE_RECHECK_READS = 6
-TEMPERATURE_RECHECK_INTERVAL_S = .010
 MOTOR_LOAD_LIMIT_RAW = 300
 # Continuous gripper contact is handled separately from arm-joint faults.
 # Register 48 is the servo's volatile maximum-output-torque limit.
@@ -46,40 +46,12 @@ GRIPPER_CONTACT_CONFIRM_S = 0.12
 GRIPPER_CONTACT_MAX_SAMPLE_GAP_S = 0.06
 GRIPPER_CONTACT_PRELOAD_TICKS = 8
 GRIPPER_CONTACT_RELEASE_HYSTERESIS_TICKS = 10
-GRIPPER_EMERGENCY_CURRENT_A = 3.8
-GRIPPER_EMERGENCY_CURRENT_S = 0.20
-# AlohaMini Host current policy for the installed position joints.
-# Values are (rated current, stall current), in amps.
-ARM_CURRENT_RATINGS_A = {2569: (2.2, 9.8), 2825: (1.4, 4.2)}
-ARM_CURRENT_NEAR_STALL_S = 0.080
-ARM_CURRENT_OVERLOAD_S = 0.650
-ARM_CURRENT_MAX_SAMPLE_GAP_S = 0.060
-ARM_FEEDBACK_LOSS_GRACE_S = 0.20
 ARM_LOAD_STALL_WARNING_S = 0.150
 ARM_LOAD_STALL_TRIP_S = 0.650
 ARM_LOAD_MAX_SAMPLE_GAP_S = 0.060
 # Round up the reference 2° error and 0.2° progress on a 4096-tick encoder.
 ARM_LOAD_STALL_ERROR_TICKS = 23
 ARM_LOAD_PROGRESS_TICKS = 3
-
-
-def confirm_temperature(sample, *, read_temperature, read_feedback, report):
-    """Confirm suspect telemetry using spaced register and full-block reads."""
-    reads = []
-    for attempt in range(TEMPERATURE_RECHECK_READS):
-        if attempt:
-            time.sleep(TEMPERATURE_RECHECK_INTERVAL_S)
-        temperature = read_temperature() if attempt % 2 == 0 else read_feedback()['temperature_c']
-        reads.append(temperature)
-        if len(reads) < 3:
-            continue
-        window = reads[-3:]
-        if (all(math.isfinite(value) and 0 <= value <= TEMPERATURE_RECHECK_CLEAR_C
-                for value in window) and max(window) - min(window) <= 2):
-            report(f"Joint temperature spike cleared: bulk={sample['temperature_c']:.0f} C, direct reads={reads} C")
-            return {**sample, 'temperature_c': float(max(window))}
-    raise ValueError(f"Joint temperature alarm not cleared by direct reads: "
-                     f"bulk={sample['temperature_c']:.0f} C, direct reads={reads} C")
 
 
 class JointDriver(FeetechReader):
@@ -125,12 +97,14 @@ class JointDriver(FeetechReader):
             return super()._request(motor_id, instruction, parameters)
         self._send_joint_packet(motor_id, instruction, parameters)
 
-    def _send_joint_packet(self, motor_id, instruction, parameters):
+    def _send_joint_packet(self, motor_id, instruction, parameters, *, deadline=None):
         body = bytes([motor_id, len(parameters) + 2, instruction]) + parameters
         packet = b'\xff\xff' + body + bytes([(~sum(body)) & 255])
         attempts = 2 if instruction in (2, 0x82) else 1
         for attempt in range(attempts):
             self.port.reset_input_buffer()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise CommandExpired('Command expired before serial port write')
             try:
                 if self.port.write(packet) != len(packet):
                     raise OSError(f'{self.bus} ID {motor_id}: incomplete instruction 0x{instruction:02x} transmission')
@@ -226,14 +200,11 @@ class JointDriver(FeetechReader):
         profile += speed.to_bytes(2, 'little')
         self._write_verified(41, profile)
 
-    def read_torque_limit(self):
-        return integer(int.from_bytes(self._read_joint_register(48, 2), 'little'), 1, 1000)
-
     def write_torque_limit(self, limit_raw):
         integer(limit_raw, 1, 1000)
         self._write_verified(48, limit_raw.to_bytes(2, 'little'))
 
-    def write_arm_goals(self, goals):
+    def write_arm_goals(self, goals, *, deadline=None):
         """Send changed positions on this bus and verify the target registers."""
         if not goals or any(type(i) is not int or not 1 <= i <= 7 for i in goals):
             raise ValueError('Grouped goal writes require arm motor IDs 1..7')
@@ -241,7 +212,7 @@ class JointDriver(FeetechReader):
         encoded = {i: integer(goals[i], 0, 4095).to_bytes(2, 'little') for i in ids}
         # Startup has already verified each joint's speed and acceleration.
         payload = b''.join(bytes([i]) + encoded[i] for i in ids)
-        self._send_joint_packet(254, 0x83, b'\x2a\x02' + payload)
+        self._send_joint_packet(254, 0x83, b'\x2a\x02' + payload, deadline=deadline)
         self._send_joint_packet(254, 0x82, b'\x2a\x02' + bytes(ids))
         replies = self._receive(ids, 2, .025)
         failed = [i for i in ids if i not in replies or replies[i].servo_error
@@ -305,9 +276,6 @@ class BoundJointDriver:
     def read_torque_feedback(self):
         return self._call('read_torque_feedback')
 
-    def read_torque_limit(self):
-        return self._call('read_torque_limit')
-
     def write_torque_limit(self, limit_raw):
         return self._call('write_torque_limit', limit_raw)
 
@@ -344,14 +312,8 @@ class JointControl:
         self.gripper_contact_direction = 0
         self.gripper_contact_goal_ticks = None
         self.gripper_contact_candidate = None
-        self.gripper_overcurrent_window = None
         self.is_arm = not self.is_gripper
-        rated, stall = ARM_CURRENT_RATINGS_A[entry['model_number']]
-        self.persistent_current_limits = (
-            ('near-stall current', round(0.8 * stall, 3), ARM_CURRENT_NEAR_STALL_S),
-            ('sustained overcurrent', 2.0 * rated, ARM_CURRENT_OVERLOAD_S),
-        ) if self.is_arm else ()
-        self.current_windows = {}
+        self.current_protection = CurrentProtection(entry['model_number'], gripper=self.is_gripper)
         self._reset_load_watch()
         self.report_temperature_recheck = report_temperature_recheck
         self.last_progress = None
@@ -405,21 +367,9 @@ class JointControl:
                 and sample['temperature_c'] >= MOTOR_TEMPERATURE_LIMIT_C):
             sample = self._confirm_motion_temperature(sample)
         self.validate_sample(sample)
-        current = abs(sample['current_a'])
-        for cause, limit, duration in self.persistent_current_limits:
-            if current < limit:
-                self.current_windows.pop(cause, None)
-                continue
-            window = self.current_windows.get(cause)
-            start = now
-            if window is not None and 0 <= now - window[1] <= ARM_CURRENT_MAX_SAMPLE_GAP_S:
-                start = window[0]
-            self.current_windows[cause] = (start, now)
-            if now - start >= duration:
-                raise ValueError(
-                    f'Joint {cause} for {now - start:.3f} s: '
-                    f'current={current:.4f} A (limit {limit:g} A)'
-                )
+        reason = self.current_protection.observe(sample['current_a'], now)
+        if reason:
+            raise ValueError('Joint ' + reason)
 
     def _confirm_motion_temperature(self, sample):
         return confirm_temperature(
@@ -472,24 +422,6 @@ class JointControl:
         self._record_goal(contact_goal, position)
         self.last_message = '夹爪接触已确认，进入限扭矩夹持；反向张开指令可解除接触锁存'
         return self.last_message
-
-    def _observe_gripper_overcurrent(self, sample, now):
-        if not self.is_gripper:
-            return ''
-        current = abs(sample['current_a'])
-        if current < GRIPPER_EMERGENCY_CURRENT_A:
-            self.gripper_overcurrent_window = None
-            return ''
-        window = self.gripper_overcurrent_window
-        start = now
-        if (window is not None
-                and 0 <= now - window[1] <= GRIPPER_CONTACT_MAX_SAMPLE_GAP_S):
-            start = window[0]
-        self.gripper_overcurrent_window = (start, now)
-        if now - start >= GRIPPER_EMERGENCY_CURRENT_S:
-            return (f'Gripper severe overcurrent sustained for {now - start:.3f} s: '
-                    f'{current:.4f} A (limit {GRIPPER_EMERGENCY_CURRENT_A:g} A)')
-        return ''
 
     def _clear_gripper_contact(self):
         self.gripper_contact_latched = False
@@ -598,16 +530,8 @@ class JointControl:
         self.feedback_loss_warned = False
         return plan
 
-    def set_absolute_target(self, position):
-        """Update an explicitly owned, monitored joint to a bounded absolute target."""
-        return self._update_target(position)
-
-    def inspect_absolute_target(self, position, *, control_snapshot=None):
+    def inspect_absolute_target(self, position, *, control_snapshot):
         """Validate one held-joint target against fresh feedback without writing."""
-        return self._update_target(position, dry_run=True, control_snapshot=control_snapshot)
-
-    def _update_target(self, position, *, dry_run=False, control_snapshot=None):
-        """Update one owned joint from a fresh measured position; retain torque."""
         if (isinstance(position, bool) or not isinstance(position, (int, float))
                 or not math.isfinite(position)):
             raise ValueError('Absolute target must be a finite number')
@@ -615,29 +539,16 @@ class JointControl:
             raise ValueError(f'Joint fault: {self.fault}')
         if not self.owned or not (self.busy or self.holding):
             raise ValueError('Joint is not owned or no longer moving/holding')
-        try:
-            if control_snapshot is None:
-                settings = self.driver.read_coordinate_settings([self.entry['id']])[self.entry['id']]
-                read_snapshot = getattr(self.driver, 'read_torque_feedback', None)
-                if read_snapshot is None:
-                    torque, sample = self.driver.read_torque(), self.driver.read_joint()
-                else:
-                    torque, sample = read_snapshot()
-            else:
-                settings, torque, sample = control_snapshot
-            if any(settings[key] != self.entry[key] for key in ('hardware_homing_offset', 'operating_mode')):
-                raise ValueError('Joint hardware coordinates changed')
-            if torque != 1:
-                raise ValueError('Joint torque unexpectedly disabled')
-            self._validate_motion_sample(sample)
-            current = float(normalize_tick(
-                self.entry, sample['position_ticks'],
-                feedback_tolerance_ticks=FEEDBACK_ENDPOINT_TOLERANCE_TICKS,
-            ))
-        except (OSError, ValueError, RuntimeError) as exc:
-            if not dry_run:
-                self._protective_release(str(exc))
-            raise
+        settings, torque, sample = control_snapshot
+        if any(settings[key] != self.entry[key] for key in ('hardware_homing_offset', 'operating_mode')):
+            raise ValueError('Joint hardware coordinates changed')
+        if torque != 1:
+            raise ValueError('Joint torque unexpectedly disabled')
+        self._validate_motion_sample(sample)
+        current = float(normalize_tick(
+            self.entry, sample['position_ticks'],
+            feedback_tolerance_ticks=FEEDBACK_ENDPOINT_TOLERANCE_TICKS,
+        ))
         # Absolute control preserves the requested goal. Servo speed/acceleration
         # settings govern motion; this layer does not replace a far goal by a
         # shorter one based on the latest feedback or on a per-update step cap.
@@ -651,17 +562,7 @@ class JointControl:
             )
             if reverse_ticks > -GRIPPER_CONTACT_RELEASE_HYSTERESIS_TICKS:
                 target = self.gripper_contact_goal_ticks
-        same_goal = target == self.target_ticks
-        plan = JointTarget(current, float(normalize_tick(self.entry, target)), target)
-        if same_goal or dry_run:
-            return plan
-        try:
-            self.driver.write_goal(target)
-        except (OSError, ValueError, RuntimeError) as exc:
-            self._protective_release(str(exc))
-            raise
-        self._record_goal(target, sample['position_ticks'])
-        return plan
+        return JointTarget(current, float(normalize_tick(self.entry, target)), target)
 
     def _record_goal(self, target, measured_tick):
         """Update the feedback monitor only after the new goal was verified."""
@@ -715,8 +616,7 @@ class JointControl:
         self.feedback_loss_started = None
         self.feedback_loss_warned = False
         self._reset_load_watch()
-        self.current_windows.clear()
-        self.gripper_overcurrent_window = None
+        self.current_protection.reset()
         self._clear_gripper_contact()
         if was_active:
             self.last_outcome = 'released'
@@ -740,13 +640,13 @@ class JointControl:
             if self.feedback_loss_started is None:
                 self.feedback_loss_started = now
             duration = now - self.feedback_loss_started
-            if duration >= ARM_FEEDBACK_LOSS_GRACE_S:
+            if duration >= FEEDBACK_LOSS_GRACE_S:
                 reason = f'Joint lost valid feedback for {duration:.3f} s'
             elif not self.feedback_loss_warned:
                 self.feedback_loss_warned = True
                 self.last_message = (
                     'Joint feedback temporarily unavailable; keeping the existing goal and torque '
-                    f'for at most {ARM_FEEDBACK_LOSS_GRACE_S:.2f} s'
+                    f'for at most {FEEDBACK_LOSS_GRACE_S:.2f} s'
                 )
                 return ('warning', self.last_message)
             else:
@@ -760,9 +660,6 @@ class JointControl:
                     load_warning = self._observe_motion_load(sample, now)
                 if self.is_gripper:
                     contact_warning = self._observe_gripper_contact(sample, now)
-                    overcurrent_reason = self._observe_gripper_overcurrent(sample, now)
-                    if overcurrent_reason:
-                        raise ValueError(overcurrent_reason)
                     if contact_warning:
                         load_warning = contact_warning
                 if self.busy:
@@ -856,8 +753,8 @@ class ArmBusHold:
     Callers must ensure people support the arm and supervise the real device.
     """
 
-    def __init__(self, side, controls, *, max_prepare_age_s, clock=time.monotonic,
-                 write_group_goals=None, read_group_snapshot=None):
+    def __init__(self, side, controls, *, max_prepare_age_s,
+                 write_group_goals, read_group_snapshot, clock=time.monotonic):
         if side not in ('left', 'right'):
             raise ValueError('Unknown arm side')
         self.names = tuple(arm_names(side))
@@ -866,6 +763,8 @@ class ArmBusHold:
         if (isinstance(max_prepare_age_s, bool) or not isinstance(max_prepare_age_s, (int, float))
                 or not math.isfinite(max_prepare_age_s) or max_prepare_age_s <= 0):
             raise ValueError('max_prepare_age_s must be positive and finite')
+        if not callable(write_group_goals) or not callable(read_group_snapshot):
+            raise ValueError('Arm group requires batch goal and feedback interfaces')
         self.controls = dict(controls)
         for index, name in enumerate(self.names):
             control = self.controls[name]
@@ -883,12 +782,12 @@ class ArmBusHold:
         self.reason = ''
 
     def inspect_hold_positions(self):
-        snapshots = self.read_group_snapshot() if self.read_group_snapshot is not None else None
+        snapshots = self.read_group_snapshot()
         plans = []
         for name in self.names:
             try:
                 control = self.controls[name]
-                snapshot = snapshots[control.entry['id']] if snapshots is not None else None
+                snapshot = snapshots[control.entry['id']]
                 plans.append(control.inspect_hold_current(control_snapshot=snapshot))
             except (OSError, ValueError, RuntimeError) as exc:
                 raise ValueError(f'{name}: preflight failed: {exc}') from exc
@@ -964,12 +863,12 @@ class ArmBusHold:
             raise ValueError('Arm group is not holding')
         if len(targets) != len(self.names):
             raise ValueError('Exactly seven targets are required')
-        snapshots = self.read_group_snapshot() if self.read_group_snapshot is not None else None
+        snapshots = self.read_group_snapshot()
         plans = []
         for name, target in zip(self.names, targets):
             try:
                 control = self.controls[name]
-                snapshot = snapshots[control.entry['id']] if snapshots is not None else None
+                snapshot = snapshots[control.entry['id']]
                 plans.append(control.inspect_absolute_target(
                     target, control_snapshot=snapshot,
                 ))
@@ -1004,7 +903,7 @@ class ArmBusHold:
             raise RuntimeError(self.reason)
 
     def apply_targets(self, targets, *, deadline=None):
-        """Preflight seven targets, then apply with the configured writer.
+        """Preflight seven targets, then dispatch changed goals as one batch.
 
         If dispatch fails, best-effort release all owned joints and latch the
         group fault; a failed or interrupted write has an unknown outcome.
@@ -1021,25 +920,21 @@ class ArmBusHold:
         check_deadline()  # Reject an expired transaction before the first write.
         attempted = []
         try:
-            if self.write_group_goals is None:
-                for name, target in zip(self.names, targets):
-                    check_deadline()
-                    attempted.append(name)  # A write may succeed with its reply lost.
-                    self.controls[name].set_absolute_target(target)
-            else:
-                changed = [(name, plan) for name, plan in zip(self.names, plans)
-                           if plan.target_ticks != self.controls[name].target_ticks]
-                if changed:
-                    goals = {self.controls[name].driver.joint_id: plan.target_ticks
-                             for name, plan in changed}
-                    check_deadline()
-                    attempted.extend(name for name, _ in changed)
-                    self.write_group_goals(goals)
-                    for name, plan in changed:
-                        control = self.controls[name]
-                        measured_tick = denormalize_tick(control.entry, plan.current_normalized)
-                        control._record_goal(plan.target_ticks, measured_tick)
+            changed = [(name, plan) for name, plan in zip(self.names, plans)
+                       if plan.target_ticks != self.controls[name].target_ticks]
+            if changed:
+                goals = {self.controls[name].driver.joint_id: plan.target_ticks
+                         for name, plan in changed}
+                check_deadline()
+                attempted.extend(name for name, _ in changed)
+                self.write_group_goals(goals, deadline=deadline)
+                for name, plan in changed:
+                    control = self.controls[name]
+                    measured_tick = denormalize_tick(control.entry, plan.current_normalized)
+                    control._record_goal(plan.target_ticks, measured_tick)
         except BaseException as exc:
+            if isinstance(exc, CommandExpired):
+                raise ValueError(TARGET_COMMAND_EXPIRED) from exc
             if not attempted and isinstance(exc, ValueError) and str(exc) == TARGET_COMMAND_EXPIRED:
                 raise  # The deadline passed during inspection, before a goal write.
             failed = []
@@ -1096,13 +991,13 @@ class ArmBusTransaction:
             raise ValueError('Transaction ID was already used or went backwards')
 
     def _discard_pending(self):
-        if self.pending and self.pending[0] == 'hold' and self.group.state == 'prepared':
+        if self.pending and self.group.state == 'prepared':
             self.group.cancel_prepare()
         self.pending = None
 
     def _expire(self):
         if self.pending:
-            _, _, started, deadline, _ = self.pending
+            _, started, deadline = self.pending
             now = self._now()
             if now < started or now > deadline:
                 self._discard_pending()
@@ -1118,45 +1013,17 @@ class ArmBusTransaction:
         if not started <= now <= started + self.timeout_s:
             self.group.cancel_prepare()
             raise ValueError('Hold inspection expired')
-        self.pending = ('hold', token, started, started + self.timeout_s, None)
+        self.pending = (token, started, started + self.timeout_s)
         self.last_token = int(token)
 
-    def prepare_targets(self, token, targets, *, deadline=None):
-        self._new_token(token)
-        self._expire()
-        if self.pending:
-            raise ValueError('Another transaction is pending')
-        started = self._now()
-        expires = started + self.timeout_s
-        if deadline is not None:
-            if not math.isfinite(deadline) or deadline <= started:
-                raise ValueError(TARGET_COMMAND_EXPIRED)
-            expires = min(expires, deadline)
-        targets = tuple(targets)
-        self.group.inspect_targets(targets)  # no writes
-        now = self._now()
-        if now > expires and deadline is not None:
-            raise ValueError(TARGET_COMMAND_EXPIRED)
-        if not started <= now <= expires:
-            raise ValueError('Target inspection expired')
-        self.pending = ('targets', token, started, expires, targets)
-        self.last_token = int(token)
-
-    def commit(self, token, *, deadline=None):
+    def commit_hold(self, token):
         self._token(token)
         self._expire()
-        if not self.pending or self.pending[1] != token:
-            raise ValueError('No matching fresh transaction')
-        kind, _, _, local_deadline, targets = self.pending
-        if deadline is not None:
-            if (isinstance(deadline, bool) or not isinstance(deadline, (float, int))
-                    or not math.isfinite(deadline)):
-                raise ValueError('Invalid external deadline')
-            local_deadline = min(local_deadline, deadline)
-        self.pending = None  # a timed-out reply cannot replay this command
-        if kind == 'hold':
-            return self.group.start(deadline=local_deadline)
-        return self.group.apply_targets(targets, deadline=local_deadline)
+        if not self.pending or self.pending[0] != token:
+            raise ValueError('No matching fresh hold transaction')
+        _, _, deadline = self.pending
+        self.pending = None  # A timed-out reply cannot repeat an enable.
+        return self.group.start(deadline=deadline)
 
     def apply_stream_targets(self, token, targets, *, deadline):
         """Validate fresh feedback and write one new streaming request once.
@@ -1178,7 +1045,7 @@ class ArmBusTransaction:
 
     def abort(self, token):
         self._token(token)
-        if not self.pending or self.pending[1] != token:
+        if not self.pending or self.pending[0] != token:
             self._expire()
             raise ValueError('No matching fresh transaction')
         self._discard_pending()

@@ -1,5 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
 """Durable robot-side episode cache; transfer only after capture stops."""
+
+from xyc.io import write_json
+# SPDX-License-Identifier: Apache-2.0
 
 import hashlib
 import json
@@ -18,13 +20,6 @@ def framed_capture(index, capture):
     return struct.pack('!I', len(packet)) + packet
 
 
-def write_manifest(path, value):
-    temporary = path.with_suffix('.tmp')
-    with temporary.open('w', encoding='utf-8') as output:
-        json.dump(value, output, ensure_ascii=False, allow_nan=False)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
 
 
 class CachedDesktopWriter:
@@ -74,8 +69,8 @@ class CachedDesktopWriter:
         self.stage.mkdir()
         self.manifest = {'version': 1, 'cache_id': self.cache_id, 'config': self.config,
                          'robot_assets': self.assets, 'frames': 0, 'status': 'recording'}
-        write_manifest(self.stage / 'manifest.json', self.manifest)
         self.output = (self.stage / 'frames.bin').open('wb', buffering=1024 * 1024)
+        write_json(self.stage / 'manifest.json', self.manifest)
         self.count, self.digest = 0, hashlib.sha256()
         self.capture_batches, self.capture_seconds = 0, 0.
 
@@ -126,7 +121,7 @@ class CachedDesktopWriter:
             source.truncate(size)
         self.count, self.digest = count, digest
         self.manifest.update(frames=count, sha256=digest.hexdigest(), status='ready')
-        write_manifest(self.stage / 'manifest.json', self.manifest)
+        write_json(self.stage / 'manifest.json', self.manifest)
 
     def remove_cache(self):
         target = self.stage.resolve()
@@ -141,7 +136,7 @@ class CachedDesktopWriter:
         self.seal()
         if interruption is not None:
             self.manifest['interruption'] = interruption
-            write_manifest(self.stage / 'manifest.json', self.manifest)
+            write_json(self.stage / 'manifest.json', self.manifest)
         interruption = self.manifest.get('interruption')
         request = {'cache_id': self.cache_id, 'frames': self.count,
                    'sha256': self.digest.hexdigest(), 'retry': True}

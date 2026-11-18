@@ -1,6 +1,5 @@
 """Motion replay checks real command semantics with fake drivers and real TCP."""
 
-import io
 import ast
 import json
 from pathlib import Path
@@ -19,8 +18,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from xyc.learning import cli
-from xyc.learning.contracts import ACTION, ACTION_NAMES, CAMERAS, OBS_STATE, STATE_NAMES
-from xyc.learning.replay import ReplayClient, ReplayPlan, execute, transport
+from xyc.contracts import ACTION, ACTION_NAMES, ACTION_SEMANTICS, CAMERAS, OBS_STATE, STATE_NAMES, mobile_action_metadata
+from xyc.learning.replay import ReplayPlan, execute
+from xyc.transport import motion
+from xyc.transport.motion import MotionClient
 
 
 @pytest.fixture
@@ -36,9 +37,9 @@ def dataset(tmp_path):
             'data_path': 'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',
             'video_path': 'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4'}
     (root / 'meta/info.json').write_text(json.dumps(info))
-    protocol = transport()
+    protocol = motion
     assets = {'state_units': protocol.STATE_UNITS, 'action_units': protocol.ACTION_UNITS,
-              'action_semantics': 'observation_then_new_ternary_command_v4',
+              'action_semantics': ACTION_SEMANTICS, 'mobile_action_scale': mobile_action_metadata(),
               'calibrations': {'calibration/' + side: {'arm': side, 'test_calibration': side}
                                for side in ('left', 'right')}}
     (root / 'meta/robot.json').write_text(json.dumps(assets))
@@ -74,7 +75,7 @@ class FakeRobot:
         self.starts += 1
         self.enabled = True
 
-    def target(self, action, ids):
+    def target(self, action, ids, *, valid_for_s=.25):
         assert ids == self.ids
         self.commands.append(list(action))
         self.arms = list(action[:14])
@@ -92,12 +93,14 @@ class FakeRobot:
 
 class FakeClient:
     def __init__(self, robot):
-        self.session = transport().ReplaySession(robot)
+        self.session = motion.ReplaySession(robot)
         self.sequence = 0
         self.snapshot = None
         self.closed = False
 
     def call(self, operation, **values):
+        if operation == 'target':
+            values.setdefault('valid_for_s', .25)
         self.sequence += 1
         self.snapshot = self.session.process({'sequence': self.sequence, 'operation': operation, **values})
         return self.snapshot
@@ -115,7 +118,7 @@ class Clock:
 
 def prepare(client, plan):
     schema = plan.metadata.schema
-    return client.call('prepare', protocol=transport().PROTOCOL, calibration_ids=plan.ids,
+    return client.call('prepare', protocol=motion.PROTOCOL, calibration_ids=plan.ids,
                        action_names=list(schema.action_names), action_units=list(schema.action_units),
                        state_names=list(schema.state_names), state_units=list(schema.state_units))
 
@@ -129,10 +132,10 @@ def test_plan_uses_recorded_ternary_actions_and_rejects_fractional_mobile_replay
     assert normal.actions[0, 15] != normal.initial_state[15]  # action is not next state.
     with pytest.raises(ValueError): ReplayPlan(dataset, speed=2.)
     with pytest.raises(ValueError): ReplayPlan(dataset, frame=3, frames=2)
-    canonical = transport().checked_action([0.] * 14 + [1., -1., 0., 1.])
+    canonical = motion.checked_action([0.] * 14 + [1., -1., 0., 1.])
     assert canonical[14:] == [1., -1., 0., 1.]
     with pytest.raises(ValueError, match='exactly'):
-        transport().checked_action([0.] * 14 + [.5, 0., 0., 0.])
+        motion.checked_action([0.] * 14 + [.5, 0., 0., 0.])
 
 
 def test_plan_rejects_mixed_new_names_and_old_physical_units(dataset):
@@ -146,7 +149,7 @@ def test_plan_rejects_mixed_new_names_and_old_physical_units(dataset):
         row[ACTION][14:] = [.015, .15, 0., 0.]
     pq.write_table(pa.Table.from_pylist(rows), path)
 
-    with pytest.raises(ValueError, match='18-dimensional XYC dataset contract'):
+    with pytest.raises(ValueError, match='旧动作格式'):
         ReplayPlan(dataset)
 
 
@@ -173,8 +176,8 @@ def test_source_and_calibration_checks_precede_any_writes(dataset):
     good.call('start')
     with pytest.raises(ValueError, match='18'):
         good.call('target', action=[0.] * 14)
-    with pytest.raises(ValueError, match='limits'):
-        good.call('target', action=[0.] * 14 + [1., 0., 0., 0.])
+    with pytest.raises(ValueError, match=r'exactly -1, 0 or \+1'):
+        good.call('target', action=[0.] * 14 + [.5, 0., 0., 0.])
 
 
 def test_recorded_start_beyond_calibration_is_rejected_before_any_enable_or_homing(dataset, tmp_path):
@@ -231,7 +234,7 @@ def test_feedback_fault_and_calibration_change_have_distinct_errors(dataset):
 
 
 def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(dataset):
-    protocol = transport()
+    protocol = motion
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
     listener.listen(1)
@@ -248,7 +251,7 @@ def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(datase
                                     'stop_confirmed': True})
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
-    client = ReplayClient('127.0.0.1', listener.getsockname()[1], keepalive_period=None)
+    client = MotionClient('127.0.0.1', listener.getsockname()[1], keepalive_period=None)
     try:
         with pytest.raises(RuntimeError, match='ID 11') as caught:
             client.call('heartbeat')
@@ -337,7 +340,7 @@ def test_real_tcp_framing_and_repeated_sequence_rejected(dataset):
     listener.listen(1)
     errors = []
     def server():
-        protocol = transport()
+        protocol = motion
         session = protocol.ReplaySession(robot)
         try:
             connection, _ = listener.accept()
@@ -354,7 +357,7 @@ def test_real_tcp_framing_and_repeated_sequence_rejected(dataset):
             session.disconnect()
     thread = threading.Thread(target=server, daemon=True)
     thread.start()
-    client = ReplayClient('127.0.0.1', listener.getsockname()[1])
+    client = MotionClient('127.0.0.1', listener.getsockname()[1])
     try:
         assert client.call('status')['ready']
         prepare(client, plan)
@@ -366,7 +369,7 @@ def test_real_tcp_framing_and_repeated_sequence_rejected(dataset):
         thread.join(3.)
         listener.close()
     assert not errors and not thread.is_alive() and len(robot.commands) == 1
-    session = transport().ReplaySession(robot)
+    session = motion.ReplaySession(robot)
     session.process({'sequence': 1, 'operation': 'status'})
     with pytest.raises(ValueError, match='sequence'):
         session.process({'sequence': 1, 'operation': 'status'})
@@ -380,7 +383,7 @@ def deadline_server(robot, *, timeout=.35, target_delay=0.):
     done = threading.Event()
     messages, errors = [], []
     def serve():
-        protocol = transport()
+        protocol = motion
         session = protocol.ReplaySession(robot)
         try:
             connection, _ = listener.accept()
@@ -419,7 +422,7 @@ def test_idle_timeout_reproduced_then_fixed_without_motion(dataset):
     plan = ReplayPlan(dataset)
     old_robot = FakeRobot(plan.ids)
     with deadline_server(old_robot) as (port, messages, errors, done):
-        old = ReplayClient('127.0.0.1', port, keepalive_period=None)
+        old = MotionClient('127.0.0.1', port, keepalive_period=None)
         try:
             old.call('status')
             assert done.wait(1.)
@@ -430,7 +433,7 @@ def test_idle_timeout_reproduced_then_fixed_without_motion(dataset):
         assert not old_robot.commands and not errors
     robot = FakeRobot(plan.ids)
     with deadline_server(robot) as (port, messages, errors, done):
-        client = ReplayClient('127.0.0.1', port)
+        client = MotionClient('127.0.0.1', port)
         try:
             client.call('status')
             time.sleep(.75)  # Longer than two backend idle deadlines; main thread deliberately pauses.
@@ -445,8 +448,8 @@ def test_readonly_keepalive_does_not_renew_velocity_watchdog(dataset):
     plan = ReplayPlan(dataset)
     class VelocityLeaseRobot(FakeRobot):
         active_until = 0.
-        def target(self, action, ids):
-            super().target(action, ids)
+        def target(self, action, ids, *, valid_for_s=.25):
+            super().target(action, ids, valid_for_s=valid_for_s)
             self.active_until = time.monotonic() + .12
         def renew(self):
             super().renew()
@@ -457,7 +460,7 @@ def test_readonly_keepalive_does_not_renew_velocity_watchdog(dataset):
             return result
     robot = VelocityLeaseRobot(plan.ids)
     with deadline_server(robot) as (port, messages, errors, done):
-        client = ReplayClient('127.0.0.1', port)
+        client = MotionClient('127.0.0.1', port)
         try:
             prepare(client, plan)
             client.call('start')
@@ -475,7 +478,7 @@ def test_keepalive_never_steals_or_retries_a_target_reply(dataset):
     plan = ReplayPlan(dataset)
     robot = FakeRobot(plan.ids)
     with deadline_server(robot, target_delay=.12) as (port, messages, errors, done):
-        client = ReplayClient('127.0.0.1', port)
+        client = MotionClient('127.0.0.1', port)
         try:
             prepare(client, plan)
             client.call('start')
@@ -497,43 +500,12 @@ def source_classes(path, globals_):
     return scope
 
 
-def test_ros_mapping_sends_arm_positions_and_separate_velocity_components():
-    class Twist:
-        def __init__(self):
-            self.header = SimpleNamespace(stamp=None, frame_id='')
-            self.twist = SimpleNamespace(linear=SimpleNamespace(x=0., y=0., z=0.),
-                                         angular=SimpleNamespace(x=0., y=0., z=0.))
-    path = Path(__file__).parents[2] / 'ros_ws/src/xyc_hardware/xyc_hardware/motion_replay.py'
-    scope = source_classes(path, {'TwistStamped': Twist, 'time': time})
-    node = scope['MotionReplay'].__new__(scope['MotionReplay'])
-    stamp = SimpleNamespace(sec=1, nanosec=25)
-    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: stamp))
-    published = []
-    node.base_pub = node.lift_pub = SimpleNamespace(publish=published.append)
-    assert node._publish_mobile([.015, .15, -.15, .60]) == 1_000_000_025
-    assert published[0].twist.linear.x == .15 and published[0].twist.linear.y == -.15
-    assert published[0].twist.angular.z == .60 and published[1].twist.linear.z == .015
-    assert published[0].header.stamp is published[1].header.stamp
-    assert all(message.header.frame_id == 'base_link' for message in published)
-    node.snapshot = lambda: {'ready': True, 'state': [0.] * 18, 'chassis': {'enabled': True}}
-    calls = []
-    node._set_arms = lambda positions, ids: calls.append((positions, ids))
-    node.condition = threading.Condition()
-    node.closing = threading.Event()
-    node.accepted_mobile = {123: {'targets': [.015, .15, -.15, .60]}}
-    node._publish_mobile = lambda values: 123
-    action = [1.] * 14 + [1., 1., -1., 1.]
-    node.target(action, ['left-id', 'right-id'])
-    assert calls == [([1.] * 14, ['left-id', 'right-id'])]
-    assert node.last_mobile == [.015, .15, -.15, .60]
-
-
-@pytest.mark.parametrize('owner', ['teleop', 'replay'])
+@pytest.mark.parametrize('owner', ['teleop', 'replay', 'policy'])
 def test_existing_coordinator_uses_stream_writes_for_both_owners(owner):
     path = Path(__file__).parents[2] / 'ros_ws/src/xyc_hardware/xyc_hardware/arm_group_coordinator.py'
     scope = source_classes(path, {'threading': threading, 'time': time})
     node = scope['ArmGroupCoordinator'].__new__(scope['ArmGroupCoordinator'])
-    node.source, node.streaming_targets = owner, True
+    node.source = owner
     node.mutex = threading.Lock()
     node.validate_command = node.check_command_time = lambda _: None
     node.token = lambda: 1
@@ -551,3 +523,80 @@ def test_existing_coordinator_uses_stream_writes_for_both_owners(owner):
     assert response.accepted
     assert sorted(calls) == [('left', 'stream_targets', tuple(range(7))),
                              ('right', 'stream_targets', tuple(range(7, 14)))]
+
+
+def test_robot_rejects_expired_model_observation_before_any_target_write(dataset):
+    plan = ReplayPlan(dataset)
+    robot = FakeRobot(plan.ids)
+    snapshot = robot.snapshot
+    robot.snapshot = lambda: {**snapshot(), 'source_time_ns': 2_000_000_000}
+    client = FakeClient(robot)
+    prepare(client, plan)
+    client.call('start')
+    with pytest.raises(ValueError, match='no target was written'):
+        client.call('target', action=[0.] * 18, observation_time_ns=1_600_000_000)
+    with pytest.raises(ValueError, match='no target was written'):
+        client.call('target', action=[0.] * 18, observation_time_ns=1_750_000_000)
+    assert robot.commands == []
+    client.call('target', action=[0.] * 18, observation_time_ns=1_950_000_000)
+    assert len(robot.commands) == 1
+
+
+@pytest.mark.parametrize('observed, validity, expected', [
+    (1_780_000_000, .2, .03), (1_950_000_000, .1, .1)])
+def test_robot_deducts_observation_age_from_the_remaining_target_lifetime(dataset, observed, validity, expected):
+    plan = ReplayPlan(dataset)
+    robot = FakeRobot(plan.ids)
+    snapshot = robot.snapshot
+    robot.snapshot = lambda: {**snapshot(), 'source_time_ns': 2_000_000_000}
+    calls = []
+    robot.target = lambda *args, **kwargs: calls.append(kwargs['valid_for_s'])
+    client = FakeClient(robot)
+    prepare(client, plan)
+    client.call('start')
+    client.call('target', action=[0.] * 18, observation_time_ns=observed, valid_for_s=validity)
+    assert calls == [pytest.approx(expected)]
+
+
+def test_replay_uses_the_configured_lift_travel(dataset, monkeypatch):
+    from xyc.learning import replay
+    path = dataset / 'data/chunk-000/file-000.parquet'
+    rows = pq.read_table(path).to_pylist()
+    for row in rows:
+        row[OBS_STATE][14] = .7
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    monkeypatch.setattr(replay, 'robot_profile', lambda: SimpleNamespace(lift_max_height_m=.8))
+    assert ReplayPlan(dataset).initial_state[14] == pytest.approx(.7)
+    monkeypatch.setattr(replay, 'robot_profile', lambda: SimpleNamespace(lift_max_height_m=.5))
+    with pytest.raises(ValueError, match=r'0..0.5 m'):
+        ReplayPlan(dataset)
+
+
+@pytest.mark.parametrize('recorded, measured', [(0., .0045), (.6, .5955)])
+def test_replay_completes_alignment_at_a_recorded_lift_endpoint(dataset, tmp_path, monkeypatch, recorded, measured):
+    from xyc.learning import replay
+    monkeypatch.setattr(replay, 'robot_profile', lambda: SimpleNamespace(lift_max_height_m=.6))
+    path = dataset / 'data/chunk-000/file-000.parquet'
+    rows = pq.read_table(path).to_pylist()
+    rows[0][OBS_STATE][14] = float(np.float32(recorded))
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    plan = ReplayPlan(dataset)
+    assert plan.initial_state[14] == recorded
+    robot, clock = FakeRobot(plan.ids, height=measured), Clock()
+    result = execute(plan, output_dir=tmp_path / 'endpoint', client_factory=lambda *_: FakeClient(robot),
+                     clock=clock, sleep=clock.sleep, progress=lambda _: None)
+    assert result['frames_sent'] == 4
+    assert [row[14] for row in robot.commands[:3]] == [0., 0., 0.]
+
+
+@pytest.mark.parametrize('missing', [False, True])
+def test_replay_rejects_an_unknown_or_mismatched_recorded_speed(dataset, missing):
+    path = dataset / 'meta/robot.json'
+    assets = json.loads(path.read_text())
+    if missing:
+        assets.pop('mobile_action_scale')
+    else:
+        assets['mobile_action_scale']['base_x_m_s'] = .30
+    path.write_text(json.dumps(assets))
+    with pytest.raises(ValueError, match='speeds are missing or differ'):
+        ReplayPlan(dataset)

@@ -16,7 +16,7 @@ PC tools/teleop_stream.py
        |                |
   LeaderState       chassis_bridge.PCChassisBridge
        |                |
-  TeleopController   base/lift TwistStamped
+  TeleopController   MobileCommand + absolute expiry
        |                |
   ArmGroupCoordinator   |
        |                |
@@ -35,6 +35,10 @@ accept absolute targets, and keep torque enabled after arrival. Relative jogs,
 fixed-duration holds with automatic release, and wrist-only test modes are removed
 from the implementation. Explicit release, shutdown and fault handling share the
 same verified torque-off path.
+Startup alone uses `prepare_hold` / `commit_hold`. All teleop, replay and policy
+targets use `stream_targets`, one validated batch per bus. There is no alternate
+non-streaming target mode. Electrical thresholds and monitoring are defined once
+in `motor_safety.py` and used by the arms, wheels and lift.
 Chassis preparation reports a distinct not-ready result while waiting for fresh,
 stationary feedback. The PC bridge retries that result within its existing deadline;
 hardware enable failures are reported without repeating the enable writes.
@@ -43,20 +47,22 @@ hardware enable failures are reported without repeating the enable writes.
 
 | Module | Responsibility |
 | --- | --- |
-| `feetech_reader.py` | Packet parsing, model checks and raw feedback |
-| `arm_calibration.py` | Follower calibration file recording and validation |
+| `xyc.robot.feetech` | Packet parsing, model checks and raw feedback |
+| `xyc.robot.calibration` | Follower calibration file recording and validation |
 | `arm_state.py` | Calibrated per-arm state and validity |
-| `arm_joint_control.py` | Shared motor transport, persistent targets, ownership and protection |
+| `motor_safety.py` | Shared current thresholds, sustained-current monitor and temperature confirmation |
+| `arm_joint_control.py` | Shared motor transport, persistent targets, ownership and joint/contact protection |
 | `motor_state_node.py` | Exclusive bus owner, state publication, grouped arm transactions |
 | `arm_group_coordinator.py` | 14-target validation and coordination of the two bus owners |
-| `teleop_transport.py` | PC/Pi wire format, frame validation and timing constants |
-| `teleop_control.py` | Following target calculation and source validation |
+| `xyc.transport.teleop` | PC/Pi wire format, frame validation and timing constants |
+| `xyc.teleop.mapping` | Following target calculation and source validation |
 | `teleop_nodes.py` | Leader receiver and ROS following controller |
 | `chassis_bridge.py` | PC keyboard intent to ROS topics; no local keyboard UI |
 | `base_kinematics.py` | Three-wheel velocity conversion |
 | `lift_tracking.py` | Multi-turn encoder tracking and lift height conversion |
 | `chassis_control.py` | Base/lift speed-mode control, homing and watchdogs |
-| `command_contract.py`, `arm_batch_planner.py` | Reusable command validation for later integrations |
+| `src/xyc/contracts.py` | Shared action/state names, units, strict command validation and fixed velocity mapping |
+| [`xyc/transport/motion.py`](../../../src/xyc/transport/motion.py) | Shared TCP client and session protocol for replay and live policy control |
 
 The base and lift driver runs inside the existing left bus owner. It does not
 open a second serial connection. Arm joints use position targets; wheels use
@@ -72,8 +78,7 @@ velocity mode; lift jogging uses velocity mode and homing establishes a height r
 - `/motors/{left,right}/group/transaction`: internal prepare/commit endpoint.
 - `/motors/{left,right}/joint/status`: read-only ownership and fault diagnostics.
 - `/motors/{left,right}/joint/torque_status`: read actual torque registers.
-- `/robot/base/cmd_vel`: base-frame x/y/yaw `TwistStamped`.
-- `/robot/lift/cmd_vel`: base-frame vertical speed `TwistStamped`.
+- `/robot/mobile/command`: one `xyc_interfaces/msg/MobileCommand` for lift/x/y/yaw, with strict ternary labels and an absolute ROS expiry time.
 - `/robot/chassis/enable`, `/robot/chassis/stop`, `/robot/chassis/home_lift`: chassis services.
 - `/robot/chassis/status`: base/lift readiness, homing, height and fault status.
 - `/robot/chassis/state`: timestamped measured lift height and base `vx/vy/wz` for the unified 18-D observation; this read-only publisher does not enable motors.
@@ -87,7 +92,7 @@ they do not guarantee physically simultaneous movement.
 
 ## Hardware configuration
 
-`config/motors.yaml` maps USB serial identities, IDs, model numbers and read rates.
+`xyc.robot/profile.yaml` is the common profile for USB identities, motor IDs/models, cameras, mechanical geometry and ports. Override it with `XYC_ROBOT_CONFIG`. Motor feedback remains configured at 60 Hz in grouped control.
 Left bus IDs 1..7 are the arm, 8..10 are the wheels and 11 is the lift.
 Right bus IDs 1..7 are the other arm. Model numbers 2825 and 2569 map to
 STS3250 and STS3095. Serial bus settings are 1000000 baud, 8N1.
@@ -96,6 +101,19 @@ The main launch has no `pilot_joint`, `keyboard_mode` or extended wrist test mod
 It does not expose the old jog/set-position single-joint services.
 Low-level joint control remains a shared implementation required by grouped control.
 Normal targets retain torque; current, temperature, lost feedback and shutdown protections remain.
+Arms, grippers, wheels and lift use the same elapsed-time current monitor. Valid samples less
+than 0.20 s apart retain overload history, including at 10 Hz; a low-current sample clears
+its limit window. A longer gap while current remains high reports lost protection monitoring.
+Replay and policy targets share one execution deadline across readiness checks, arm service
+dispatch/confirmation and base/lift publication/confirmation. Mobile messages retain the
+original target timestamp instead of gaining a new lifetime after an arm acknowledgement.
+The same expiry reaches the controller tick and the shared serial send function, which checks it
+after input-buffer preparation and immediately before writing. Ordinary expiry stops mobile
+velocity and does not become a latched electrical fault. Acceptance events are published only
+after controller application; expired or unconfirmed targets never become dataset labels.
+If the replay or policy control process exits, ROS launch shuts down the motor owners.
+Their shared shutdown sends zero wheel/lift velocity, releases the velocity axes and
+turns off torque on owned arm joints so they stop tracking old goals.
 One isolated invalid arm-feedback frame pauses new targets but keeps the existing goal.  A joint
 releases only when valid feedback remains missing for 0.20 s; teleoperation waits up to 0.50 s
 before stopping its controller.  Out-of-range numeric feedback still stops immediately; a servo

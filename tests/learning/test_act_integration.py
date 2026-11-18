@@ -14,12 +14,13 @@ import torch
 
 from xyc.learning.checkpoint import load_checkpoint
 from xyc.learning.config import TrainConfig, load_config
-from xyc.learning.contracts import (
+from xyc.contracts import (
     ACTION, ACTION_NAMES, ACTION_UNITS, CAMERAS, OBS_STATE, STATE_NAMES, STATE_UNITS, robot_action,
 )
-from xyc.learning.dataset import DatasetMetadata, EpisodeDataset, RGBVideos
+from xyc.learning.dataset_metadata import DatasetMetadata
+from xyc.learning.dataset import EpisodeDataset
 from xyc.learning.inference import PolicyRunner, predict_dataset, validate_inputs
-from xyc.learning.registry import make_policy
+from xyc.learning.registry import make_policy, policy_adapter
 from xyc.learning.trainer import StepBatches, train, validate_resume
 
 TINY = {'image_size': [64, 64], 'chunk_size': 4, 'n_action_steps': 2, 'dim_model': 64, 'n_heads': 4,
@@ -80,7 +81,7 @@ def config_for(root, output, steps=2):
 
 def batch_for(root):
     metadata = DatasetMetadata(root)
-    dataset = EpisodeDataset(metadata, [0], chunk_size=4, image_size=[64, 64])
+    dataset = EpisodeDataset(metadata, [0], spec=policy_adapter('act').sample_spec(TINY, metadata.schema))
     try:
         sample = dataset[1]
         return metadata, {key: item.unsqueeze(0) for key, item in sample.items()}
@@ -90,14 +91,14 @@ def batch_for(root):
 
 def test_episode_boundary_and_train_only_stats(dataset_root):
     meta = DatasetMetadata(dataset_root)
-    dataset = EpisodeDataset(meta, [0, 1], chunk_size=4, image_size=[64, 64])
+    dataset = EpisodeDataset(meta, [0, 1], spec=policy_adapter('act').sample_spec(TINY, meta.schema))
     try:
         last = dataset[5]
         assert last['action_is_pad'].tolist() == [False, True, True, True]
         assert torch.equal(last[ACTION][0], last[ACTION][3])
         assert dataset[6][OBS_STATE][0] == 100
-        assert meta.statistics([0])[OBS_STATE]['mean'][0] == 2.5
-        assert meta.statistics([1])[OBS_STATE]['mean'][0] == 102.5
+        assert meta.statistics([0], policy_adapter('act').statistics_spec(TINY, meta.schema))[OBS_STATE]['mean'][0] == 2.5
+        assert meta.statistics([1], policy_adapter('act').statistics_spec(TINY, meta.schema))[OBS_STATE]['mean'][0] == 102.5
         assert not set(meta.split()[0]) & set(meta.split()[1])
         assert meta.fingerprint([0]) != meta.fingerprint([1])
         with pytest.raises(ValueError, match='overlapping'):
@@ -108,7 +109,7 @@ def test_episode_boundary_and_train_only_stats(dataset_root):
 
 def test_rgb_camera_order_and_normalization(dataset_root):
     meta, batch = batch_for(dataset_root)
-    adapter = make_policy('act', model_config=TINY, schema=meta.schema, statistics=meta.statistics([0]))
+    adapter = make_policy('act', model_config=TINY, schema=meta.schema, statistics=meta.statistics([0], policy_adapter('act').statistics_spec(TINY, meta.schema)))
     assert tuple(adapter.config.image_features) == tuple('observation.images.' + c for c in CAMERAS)
     rgb = batch['observation.images.forward'][0, :, 0, 0]
     assert rgb[0] > 180 and rgb[2] < 40  # RGB, not OpenCV BGR.
@@ -128,7 +129,7 @@ def test_real_loss_updates_backbone_and_head(dataset_root):
     torch.set_num_threads(2)
     torch.manual_seed(42)
     meta, batch = batch_for(dataset_root)
-    adapter = make_policy('act', model_config=TINY, schema=meta.schema, statistics=meta.statistics([0]))
+    adapter = make_policy('act', model_config=TINY, schema=meta.schema, statistics=meta.statistics([0], policy_adapter('act').statistics_spec(TINY, meta.schema)))
     named = dict(adapter.named_parameters())
     names = ['policy.model.backbone.conv1.weight', 'policy.model.action_head.weight']
     before = {name: named[name].detach().clone() for name in names}
@@ -141,7 +142,7 @@ def test_real_loss_updates_backbone_and_head(dataset_root):
     assert all(not torch.equal(before[name], named[name]) for name in names)
     prediction = adapter.predict_chunk(batch)
     assert prediction.shape == (1, 4, 18) and torch.isfinite(prediction).all()
-    assert np.isfinite(adapter.validation_metrics(batch)['action_l1_normalized'])
+    assert np.isfinite(adapter.validation_metrics(batch)['action_l1_normalized'].value)
 
 
 def test_resume_matches_uninterrupted_and_offline_inference(dataset_root, tmp_path):
@@ -181,7 +182,7 @@ def test_resume_matches_uninterrupted_and_offline_inference(dataset_root, tmp_pa
 def test_action_queue_and_reset(dataset_root, coefficient):
     meta, batch = batch_for(dataset_root)
     options = {**TINY, 'temporal_ensemble_coeff': coefficient, 'n_action_steps': 2 if coefficient is None else 1}
-    adapter = make_policy('act', model_config=options, schema=meta.schema, statistics=meta.statistics([0]))
+    adapter = make_policy('act', model_config=options, schema=meta.schema, statistics=meta.statistics([0], policy_adapter('act').statistics_spec(TINY, meta.schema)))
     runner = PolicyRunner(adapter)
     with patch.object(adapter, 'predict_chunk', wraps=adapter.predict_chunk) as call:
         first = runner.step(batch)

@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 from typing import Protocol, Sequence
+import time
 
-from xyc.learning.contracts import robot_action
+from xyc.contracts import COMMAND_VALIDITY_S, robot_action
 
 
 @dataclass(frozen=True)
@@ -45,21 +46,45 @@ class PolicyExecutor:
         self.runner.reset()
         self.sequence = 0
 
-    def step(self, batch, *, observation=None, video_frames=None):
+    def step(self, batch, *, observation=None, video_frames=None, deadline=None):
         action = self.runner.step(batch, observation=observation, video_frames=video_frames)
         values = action[0].detach().cpu().tolist()
-        command = robot_action(values, self.runner.adapter.schema)
+        return self.execute_action(values, deadline=deadline, observation=observation)
+
+    def execute_action(self, values, *, record=True, deadline=None, observation=None):
+        """Manual preparation and model execution share one command path.
+
+        Regression outputs are projected onto the full calibrated position
+        domain. Raw predictions and the actual bounded command remain separate
+        trace records; there is no step-size or target-ahead restriction.
+        """
+        command = robot_action(values, self.runner.adapter.schema, bound_arms=True)
+        if observation is not None and observation.get('source_clock') == 'robot_ros':
+            command['observation_time_ns'] = observation['source_time_ns']
         mobile = command['mobile_command']
         submitted = [*command['arm_position_normalized'],
                      mobile['lift'], mobile['x'], mobile['y'], mobile['yaw']]
         self.sequence += 1
+        validity = (COMMAND_VALIDITY_S if deadline is None else
+                    min(COMMAND_VALIDITY_S, deadline - time.monotonic()))
+        if validity <= 0:
+            if record:
+                self.runner.record_execution(
+                    sent_action=None, accepted=False, command_id=str(self.sequence),
+                    message='Inference deadline expired before dispatch; no action was sent')
+            try:
+                self.command_sink.stop()
+            except BaseException:
+                pass
+            raise TimeoutError('Inference deadline expired before dispatch; no action was sent')
         try:
             result = self.command_sink.dispatch(
-                command, sequence=self.sequence, valid_for_s=command['action_period_s'])
+                command, sequence=self.sequence, valid_for_s=validity)
         except BaseException as exc:
-            self.runner.record_execution(
-                sent_action=submitted, accepted=False, command_id=str(self.sequence),
-                message=f'{type(exc).__name__}: {exc}')
+            if record:
+                self.runner.record_execution(
+                    sent_action=submitted, accepted=None, command_id=str(self.sequence),
+                    message=f'{type(exc).__name__}: {exc}')
             try:
                 self.command_sink.stop()
             except BaseException:
@@ -67,11 +92,12 @@ class PolicyExecutor:
             raise
         if not isinstance(result, CommandResult):
             raise TypeError('Command sink must return CommandResult')
-        self.runner.record_execution(
-            sent_action=submitted, accepted=result.accepted, command_id=result.command_id,
-            source_time_ns=result.source_time_ns, source_clock=result.source_clock,
-            message=result.message)
-        if result.feedback_state is not None:
+        if record:
+            self.runner.record_execution(
+                sent_action=submitted, accepted=result.accepted, command_id=result.command_id,
+                source_time_ns=result.source_time_ns, source_clock=result.source_clock,
+                message=result.message)
+        if record and result.feedback_state is not None:
             self.runner.record_feedback(
                 state=result.feedback_state, source_time_ns=result.feedback_time_ns,
                 source_clock=result.feedback_clock, message=result.message)

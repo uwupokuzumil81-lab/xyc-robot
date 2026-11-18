@@ -1,8 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
 """Pair read-only ROS inputs and relay complete samples to the desktop writer."""
 
+from xyc.robot.profile import robot_profile
+from xyc.assets import follower_calibration_ids
+# SPDX-License-Identifier: Apache-2.0
+
 from collections import Counter, OrderedDict
-import hashlib
 import json
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -18,20 +20,18 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from xyc_interfaces.srv import RecordingControl
 
-from .alignment import (
-    ACTION_SEMANTICS, ACTION_UNITS, CAMERAS, RECORDING_CONTRACT, STATE_UNITS,
-    CaptureBuffer,
-)
-from .config import checked_config
-from .stream import CaptureRelay, RecordingBackpressure, RelayServer, STREAM_PORT
-from .cache import CachedDesktopWriter
+from xyc.contracts import ACTION_SEMANTICS, ACTION_UNITS, CAMERAS, STATE_UNITS, mobile_action_metadata
+from xyc.recording.alignment import RECORDING_CONTRACT, CaptureBuffer
+from xyc.recording.config import checked_config
+from xyc.recording.stream import CaptureRelay, RecordingBackpressure, RelayServer, STREAM_PORT
+from xyc.recording.cache import CachedDesktopWriter
 
 
 class RecorderNode(Node):
     def __init__(self, **kwargs):
         super().__init__('recorder', **kwargs)
         self.project = Path(self.declare_parameter(
-            'project_dir', str(Path.home() / 'pi05_from_zero')).value).expanduser().resolve()
+            'project_dir', str(robot_profile().robot_root)).value).expanduser().resolve()
         self.cache_dir = Path(self.declare_parameter(
             'cache_dir', str(self.project / '.runtime/recording-cache')).value).expanduser().resolve()
         port = self.declare_parameter('stream_port', STREAM_PORT).value
@@ -163,10 +163,7 @@ class RecorderNode(Node):
                 'action_semantics': ACTION_SEMANTICS,
                 'state_units': list(STATE_UNITS[:size]),
                 'action_units': list(ACTION_UNITS[:size]),
-                'mobile_action_scale': {
-                    'lift_m_s': .015, 'base_x_m_s': .15,
-                    'base_y_m_s': .15, 'base_yaw_rad_s': .60,
-                },
+                'mobile_action_scale': mobile_action_metadata(),
                 'coordinate_frame': 'base_link',
                 'time_semantics': 'camera read completion and servo receipt; no hardware exposure sync'}
 
@@ -271,10 +268,7 @@ class RecorderNode(Node):
             if self.last_capture is not None and now - self.last_capture > .5:
                 self.finish_interrupted(self.buffer.reason, now - self.last_capture)
             return
-        expected = tuple(hashlib.sha256(json.dumps(
-            self.writer_assets['calibrations'][f'calibration/{side}'], sort_keys=True,
-            separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
-            for side in ('left', 'right'))
+        expected = tuple(follower_calibration_ids(self.writer_assets))
         if capture.calibration_ids != expected:
             raise ValueError('从臂报告的标定版本与采集器保存的标定文件不一致')
         try:

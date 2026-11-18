@@ -4,13 +4,57 @@ import torch
 from torch import nn
 import numpy as np
 
-from xyc.learning.contracts import ACTION, OBS_STATE
+from xyc.contracts import ACTION, OBS_STATE
+from xyc.learning.data_spec import SampleSpec, StatisticsSpec, ValidationSpec, MetricValue
+from xyc.images import decode_jpeg, resize_rgb
+from xyc.runtime.strategies.base import ChunkExecutionSpec
 from .configuration_act import ACTConfig
 from .modeling_act import ACTPolicy
 
 
 class ACTAdapter(nn.Module):
     name = 'act'
+
+    def model_config(self):
+        """Export ACT constructor options; dimensions come from the shared schema."""
+        return {key: value for key, value in self.config.to_dict().items()
+                if key not in ('cameras', 'state_dim', 'action_dim')}
+
+    @staticmethod
+    def training_options(options, *, smoke=False, no_pretrained=False):
+        options = dict(options)
+        if smoke:
+            options.update(image_size=[64, 64], chunk_size=4, n_action_steps=2,
+                           dim_model=64, n_heads=4, dim_feedforward=256,
+                           n_encoder_layers=1, n_decoder_layers=1,
+                           n_vae_encoder_layers=1, pretrained_backbone_weights=None)
+        if no_pretrained:
+            options['pretrained_backbone_weights'] = None
+        return options
+
+    @staticmethod
+    def sample_spec(model_config, schema):
+        config = ACTConfig(cameras=schema.cameras, state_dim=len(schema.state_names),
+                           action_dim=len(schema.action_names), **model_config)
+        return SampleSpec(action_offsets=tuple(range(config.chunk_size)))
+
+    @staticmethod
+    def statistics_spec(model_config, schema):
+        return StatisticsSpec(
+            features={OBS_STATE: ('mean', 'std'), ACTION: ('mean', 'std')},
+            constants={'images': {'mode': 'imagenet', 'mean': [.485, .456, .406],
+                                  'std': [.229, .224, .225]}, 'epsilon': 1e-6})
+
+    @staticmethod
+    def validation_spec():
+        return ValidationSpec('action_l1_normalized', 'min')
+
+    def chunk_execution_spec(self):
+        return ChunkExecutionSpec(self.config.n_action_steps, self.config.chunk_size,
+                                  ensemble=self.config.temporal_ensemble_coeff is not None)
+
+    def ensemble_action(self, chunk):
+        return self.policy.temporal_ensembler.update(chunk)
 
     def __init__(self, model_config, schema, statistics, *, initialize_pretrained=True):
         super().__init__()
@@ -55,8 +99,12 @@ class ACTAdapter(nn.Module):
         result = {OBS_STATE: (state - self.state_mean) / self.state_std.clamp_min(self.epsilon)}
         for key in self.config.image_features:
             image = batch[key]
-            if (image.dtype != torch.uint8 or tuple(image.shape) != (len(state), 3, *self.config.image_size)):
-                raise ValueError(f'{key} must be RGB uint8 [batch,3,height,width] at configured size')
+            if image.dtype != torch.uint8 or image.ndim != 4 or tuple(image.shape[:2]) != (len(state), 3):
+                raise ValueError(f'{key} must be raw RGB uint8 [batch,3,height,width]')
+            if tuple(image.shape[-2:]) != tuple(self.config.image_size):
+                images = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+                image = torch.stack([torch.from_numpy(resize_rgb(rgb, self.config.image_size)).permute(2, 0, 1)
+                                     for rgb in images])
             image = image.to(self.device, dtype=torch.float32) / 255.
             result[key] = (image - self.image_mean) / self.image_std
         if training:
@@ -77,21 +125,9 @@ class ACTAdapter(nn.Module):
         if (not isinstance(state, (tuple, list)) or len(state) != len(self.schema.state_names)
                 or not isinstance(images, dict) or set(images) != set(self.schema.cameras)):
             raise ValueError('Live ACT observation does not match the checkpoint schema')
-        try:
-            import cv2
-        except ModuleNotFoundError as exc:
-            raise ValueError('Live ACT preprocessing requires opencv-python') from exc
         batch = {OBS_STATE: torch.tensor([state], dtype=torch.float32)}
-        height, width = self.config.image_size
         for name in self.schema.cameras:
-            encoded = images[name]
-            if not isinstance(encoded, bytes) or not encoded.startswith(b'\xff\xd8'):
-                raise ValueError(f'{name}: live image is not JPEG')
-            bgr = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if bgr is None:
-                raise ValueError(f'{name}: JPEG decode failed')
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
+            rgb = decode_jpeg(images[name])
             batch['observation.images.' + name] = torch.from_numpy(
                 np.ascontiguousarray(rgb)).permute(2, 0, 1).unsqueeze(0)
         return batch
@@ -119,7 +155,7 @@ class ACTAdapter(nn.Module):
         valid = (~prepared['action_is_pad']).unsqueeze(-1)
         error = ((normalized - prepared[ACTION]).abs() * valid).sum()
         denom = valid.sum() * len(self.schema.action_names)
-        return {'action_l1_normalized': float(error / denom.clamp_min(1))}
+        return {'action_l1_normalized': MetricValue(float(error / denom.clamp_min(1)), float(denom))}
 
     def optimizer_groups(self, *, learning_rate, backbone_learning_rate):
         groups = self.policy.get_optim_params()

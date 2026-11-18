@@ -9,17 +9,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-from .contracts import (
-    ACTION, ACTION_NAMES, ACTION_UNITS, ARM_NAMES, MOBILE_ACTION_SCALE, OBS_STATE,
-    PolicySchema, STATE_NAMES, STATE_UNITS,
+from xyc.contracts import (
+    ACTION, ACTION_NAMES, ACTION_UNITS, OBS_STATE, PolicySchema, checked_mobile_action,
 )
-
-
-LEGACY_ACTION_NAMES = ARM_NAMES + ('lift.velocity_m_s', 'base.vx_m_s', 'base.vy_m_s', 'base.wz_rad_s')
-LEGACY_ACTION_UNITS = ('normalized',) * 14 + ('m/s', 'm/s', 'm/s', 'rad/s')
-RATIO_ACTION_NAMES = ARM_NAMES + ('lift.velocity_ratio', 'base.vx_ratio', 'base.vy_ratio', 'base.wz_ratio')
-RATIO_ACTION_UNITS = ('normalized',) * 18
-CANONICAL_ACTION_SEMANTICS = 'observation_then_new_ternary_command_v4'
 
 
 @dataclass(frozen=True)
@@ -48,25 +40,9 @@ class DatasetMetadata:
         action_names = tuple(self.features[ACTION].get('names') or [f'action_{i}' for i in range(action_dim)])
         state_units = tuple(assets.get('state_units', ['unknown'] * state_dim))
         action_units = tuple(assets.get('action_units', ['unknown'] * action_dim))
-        self.mobile_conversion = None
-        if action_names == LEGACY_ACTION_NAMES and action_units == LEGACY_ACTION_UNITS:
-            self.mobile_conversion = 'physical_to_ternary'
-        elif action_names == RATIO_ACTION_NAMES and action_units == RATIO_ACTION_UNITS:
-            self.mobile_conversion = 'ratio_to_ternary'
-        if self.mobile_conversion:
-            if state_names != STATE_NAMES or state_units != STATE_UNITS:
-                raise ValueError('Legacy mobile actions have an unsupported state schema')
-            assets = dict(assets)
-            assets['source_action_names'] = list(action_names)
-            assets['source_action_units'] = list(action_units)
-            assets['source_action_semantics'] = assets.get('action_semantics')
-            assets['action_units'] = list(ACTION_UNITS)
-            assets['action_semantics'] = CANONICAL_ACTION_SEMANTICS
-            assets['mobile_action_scale'] = {
-                'lift_m_s': MOBILE_ACTION_SCALE[0], 'base_x_m_s': MOBILE_ACTION_SCALE[1],
-                'base_y_m_s': MOBILE_ACTION_SCALE[2], 'base_yaw_rad_s': MOBILE_ACTION_SCALE[3],
-            }
-            action_names, action_units = ACTION_NAMES, ACTION_UNITS
+        if any(name.startswith(('lift.velocity_', 'base.vx_ratio', 'base.vy_ratio', 'base.wz_ratio'))
+               for name in action_names) or (action_names == ACTION_NAMES and action_units != ACTION_UNITS):
+            raise ValueError('旧动作格式需先离线迁移或重新采集；数据读取不会自动转换动作')
         self.assets = assets
         self.schema = PolicySchema(
             self.cameras,
@@ -83,6 +59,8 @@ class DatasetMetadata:
                 or any(e.length < 1 for e in episodes)):
             raise ValueError('Missing, duplicate or empty committed episode metadata')
         self._numeric = OrderedDict()
+        self._task_indices = OrderedDict()
+        self._tasks = None
 
     def path(self, template, **values):
         path = (self.root / template.format(**values)).resolve()
@@ -112,22 +90,13 @@ class DatasetMetadata:
         if len(rows) != self.episodes[episode].length or [r['frame_index'] for r in rows] != list(range(len(rows))):
             raise ValueError('Episode frame count/order differs from metadata')
         values = {key: np.asarray([r[key] for r in rows], dtype=np.float32) for key in (OBS_STATE, ACTION)}
-        if self.mobile_conversion == 'physical_to_ternary':
-            scale = np.asarray(MOBILE_ACTION_SCALE, dtype=np.float32)
-            mobile = values[ACTION][:, 14:]
-            distance = np.min(np.abs(mobile[:, :, None] - np.stack((-scale, np.zeros(4), scale), axis=1)), axis=2)
-            tolerance = np.maximum(1e-6, scale * 1e-4)
-            if np.any(distance > tolerance):
-                raise ValueError('Legacy physical mobile actions are not fixed -1/0/+1 speeds')
-            values[ACTION][:, 14:] = np.where(
-                np.abs(mobile) <= tolerance, 0., np.sign(mobile))
-        elif self.mobile_conversion == 'ratio_to_ternary':
-            mobile = values[ACTION][:, 14:]
-            values[ACTION][:, 14:] = np.where(mobile >= .5, 1., np.where(mobile <= -.5, -1., 0.))
         if (values[OBS_STATE].shape != (len(rows), len(self.schema.state_names))
                 or values[ACTION].shape != (len(rows), len(self.schema.action_names))
                 or not all(np.isfinite(v).all() for v in values.values())):
             raise ValueError('Invalid state/action dimensions or non-finite values')
+        if self.schema.action_names == ACTION_NAMES:
+            for row in values[ACTION]:
+                checked_mobile_action(row[14:])
         self._numeric[episode] = values
         while len(self._numeric) > 4:
             self._numeric.popitem(last=False)
@@ -152,22 +121,65 @@ class DatasetMetadata:
             raise ValueError('Invalid, overlapping or empty episode split')
         return sorted(train), sorted(val)
 
-    def statistics(self, episodes):
-        # Compute from TRAIN episodes only. Dataset-wide stats may include validation.
-        result = {}
-        for key in (OBS_STATE, ACTION):
-            arrays = [self.numeric(i)[key].astype(np.float64) for i in episodes]
-            values = np.concatenate(arrays)
-            result[key] = {'mean': values.mean(0).tolist(), 'std': values.std(0).tolist(),
-                           'count': len(values)}
-        result['images'] = {'mode': 'imagenet', 'mean': [.485, .456, .406], 'std': [.229, .224, .225]}
-        result['epsilon'] = 1e-6
+    def task_text(self, episode, frame):
+        """Resolve per-frame LeRobot task IDs, including pandas-index task tables."""
+        if episode not in self._task_indices:
+            path = self.data_path(episode)
+            if 'task_index' in pq.read_schema(path).names:
+                table = pq.read_table(path, columns=['episode_index', 'frame_index', 'task_index'])
+                rows = sorted((r for r in table.to_pylist() if r['episode_index'] == episode),
+                              key=lambda r: r['frame_index'])
+                self._task_indices[episode] = [row['task_index'] for row in rows]
+            else:
+                self._task_indices[episode] = None
+            while len(self._task_indices) > 4:
+                self._task_indices.popitem(last=False)
+        self._task_indices.move_to_end(episode)
+        indices = self._task_indices[episode]
+        if indices is None:
+            tasks = self.episodes[episode].metadata.get('tasks', [])
+            if len(tasks) != 1:
+                raise ValueError('Adapter requests task text but episode has no unambiguous task')
+            text = tasks[0]
+        else:
+            if self._tasks is None:
+                tasks = pq.read_table(self.root / 'meta/tasks.parquet')
+                if 'task' in tasks.column_names:
+                    text_column = 'task'
+                else:
+                    pandas = json.loads((tasks.schema.metadata or {}).get(b'pandas', b'{}'))
+                    indexes = [name for name in pandas.get('index_columns', []) if isinstance(name, str)]
+                    if len(indexes) != 1:
+                        raise ValueError('Task table must contain a task text column or a named string index')
+                    text_column = indexes[0]
+                self._tasks = dict(zip(tasks['task_index'].to_pylist(), tasks[text_column].to_pylist()))
+            text = self._tasks[int(indices[frame])]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError('Dataset task must be nonempty text')
+        return text
+
+    def statistics(self, episodes, spec):
+        """Compute only adapter-requested statistics, using training episodes only."""
+        from copy import deepcopy
+        result = deepcopy(spec.constants)
+        for key, methods in spec.features.items():
+            if key not in (OBS_STATE, ACTION):
+                raise ValueError('Unsupported numeric statistics feature: ' + key)
+            values = np.concatenate([self.numeric(i)[key].astype(np.float64) for i in episodes])
+            reducers = {'mean': lambda: values.mean(0), 'std': lambda: values.std(0),
+                        'min': lambda: values.min(0), 'max': lambda: values.max(0),
+                        'q01': lambda: np.quantile(values, .01, axis=0),
+                        'q99': lambda: np.quantile(values, .99, axis=0)}
+            result[key] = {name: reducers[name]().tolist() for name in methods}
+            result[key]['count'] = len(values)
         return result
 
     def fingerprint(self, episodes):
         digest = hashlib.sha256()
         digest.update(json.dumps({'schema': self.schema.to_dict(), 'assets': self.assets}, sort_keys=True).encode())
         paths = set()
+        if (self.root / 'meta/tasks.parquet').is_file():
+            paths.add(self.root / 'meta/tasks.parquet')
         for index in sorted(episodes):
             e = self.episodes[index]
             digest.update(json.dumps({'index': e.index, 'length': e.length, 'metadata': e.metadata}, sort_keys=True).encode())
@@ -182,13 +194,12 @@ class DatasetMetadata:
 
 
 class RGBVideos:
-    def __init__(self, image_size, max_frames=64):
-        self.image_size, self.max_frames = tuple(image_size), max_frames
+    def __init__(self, max_frames=64):
+        self.max_frames = max_frames
         self.containers, self.frames = OrderedDict(), OrderedDict()
 
     def read(self, path, seconds, fps):
         import av
-        import cv2
         key = (str(path), round(seconds * fps))
         if key in self.frames:
             self.frames.move_to_end(key)
@@ -214,8 +225,6 @@ class RGBVideos:
                 break
         if image is None:
             raise ValueError(f'No video frame near {seconds:.6f}s in {path}')
-        height, width = self.image_size
-        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
         self.frames[key] = image
         while len(self.frames) > self.max_frames:
             self.frames.popitem(last=False)

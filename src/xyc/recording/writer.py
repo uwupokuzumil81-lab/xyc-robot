@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Portable LeRobot v3.0 writer used on the operator's computer.
 
 Each committed episode occupies a v3 data/video file, with explicit episode
@@ -6,9 +5,14 @@ offsets. Actual source times are retained separately from the nominal FPS grid.
 The upstream LeRobot reader is used by the compatibility test.
 """
 
+from xyc.io import write_json
+from xyc.robot.profile import robot_profile
+# SPDX-License-Identifier: Apache-2.0
+
 from fractions import Fraction
 from concurrent.futures import ThreadPoolExecutor
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -21,22 +25,21 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from xyc.locking import acquire_file_lock
 
-from .alignment import (
-    ACTION_NAMES, ACTION_SEMANTICS, CAMERAS, STATE_NAMES, CameraFrame,
-    checked_ternary_mobile_action,
-)
+from xyc.contracts import ACTION_NAMES, ACTION_SEMANTICS, CAMERAS, STATE_NAMES, checked_mobile_action
+from xyc.observation import CameraFrame
 from .config import checked_config
 
 
-def json_write(path, value):
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    with temporary.open('w', encoding='utf-8') as file:
-        json.dump(value, file, ensure_ascii=False, allow_nan=False, indent=2)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temporary, path)
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        while block := source.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def acquire_dataset_lock(path):
@@ -45,24 +48,10 @@ def acquire_dataset_lock(path):
     Keep the lock file in place: unlinking it permits POSIX writers to lock
     different inodes at the same path and write concurrently.
     """
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        if os.name == 'nt':
-            import msvcrt
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return acquire_file_lock(path)
     except OSError as exc:
-        os.close(descriptor)
         raise FileExistsError(f'数据集正在被另一个采集程序写入：{path.parent}') from exc
-    try:
-        os.ftruncate(descriptor, 0)
-        os.write(descriptor, str(os.getpid()).encode())
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
 
 
 def scalar_stats(array):
@@ -96,13 +85,16 @@ def histogram_stats(histogram, frames):
 
 
 class LeRobotV3Writer:
-    def __init__(self, datasets_dir, config, *, robot_assets=None, width=640, height=480,
+    def __init__(self, datasets_dir, config, *, robot_assets=None, width=None, height=None,
                  recover_transfer_id=None):
         self.config = checked_config(config)
         self.root = (Path(datasets_dir).expanduser().resolve() / self.config['dataset']).resolve()
         if not self.root.is_relative_to(Path(datasets_dir).expanduser().resolve()):
             raise ValueError('Dataset path escaped datasets_dir')
-        self.width, self.height = width, height
+        default_height, default_width = robot_profile().image_size
+        self.width = default_width if width is None else width
+        self.height = default_height if height is None else height
+        width, height = self.width, self.height
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise ValueError('Video size must be positive and even')
         self.size = 18 if self.config['scope'] == 'mobile' else 14
@@ -122,6 +114,15 @@ class LeRobotV3Writer:
         try:
             self.lock_fd = acquire_dataset_lock(self.lock_path)
             pending = list(self.root.glob('.pending-*'))
+            if self.config['resume']:
+                # Older writers could be interrupted between mkdir and writing ownership.
+                # Only remove an empty directory with the writer's generated name.
+                for stage in pending[:]:
+                    suffix = stage.name.removeprefix('.pending-')
+                    if (self.is_transfer_id(suffix) and not stage.is_symlink()
+                            and stage.is_dir() and not any(stage.iterdir())):
+                        stage.rmdir()
+                        pending.remove(stage)
             if pending and (not recover_transfer_id or not self.config['resume']):
                 raise ValueError('Unfinished .pending episode found; preserve it and recover before resuming')
             info_path = self.root / 'meta/info.json'
@@ -136,7 +137,6 @@ class LeRobotV3Writer:
                         or self.info.get('fps') != self.config['fps']
                         or self.info.get('features', {}) != self.features()):
                     raise ValueError('Resume FPS, feature names, units or image sizes differ')
-                self.tasks = pd.read_parquet(self.root / 'meta/tasks.parquet')
                 if assets != assets_expected:
                     raise ValueError('Calibration/robot assets differ from the existing dataset')
             else:
@@ -147,19 +147,23 @@ class LeRobotV3Writer:
                              'data_path': 'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',
                              'video_path': 'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4',
                              'features': self.features()}
-                self.tasks = pd.DataFrame({'task_index': pd.Series(dtype='int64')})
-                json_write(self.root / 'meta/robot.json', assets_expected)
-                json_write(self.root / 'meta/info.json', self.info)
-                self.tasks.to_parquet(self.root / 'meta/tasks.parquet')
+                self.initialize_metadata(assets_expected)
             for stage in pending:
                 marker = stage / 'transfer.json'
                 if (stage.is_symlink() or not marker.is_file()
                         or json.loads(marker.read_text(encoding='utf-8')).get('cache_id') != recover_transfer_id):
                     raise ValueError('Unfinished episode belongs to a different transfer; refusing to remove it')
             for stage in pending:
-                # Explicit resume of the SAME durable Pi cache. Final dataset
-                # files are untouched; the source can retransmit the full episode.
+                self.recover_commit(stage)
                 shutil.rmtree(stage)
+            tasks_path = self.root / 'meta/tasks.parquet'
+            try:
+                self.tasks = pd.read_parquet(tasks_path)
+            except (FileNotFoundError, pa.ArrowInvalid):
+                if not self.config['resume']:
+                    raise
+                self.recover_empty_metadata(pending)
+                self.tasks = pd.read_parquet(tasks_path)
             self.task = self.config['task']
             self.task_index = int(self.tasks.loc[self.task].task_index) if self.task in self.tasks.index else len(self.tasks)
             cv2.setNumThreads(1)
@@ -167,6 +171,132 @@ class LeRobotV3Writer:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def is_transfer_id(value):
+        return isinstance(value, str) and len(value) == 32 and all(c in '0123456789abcdef' for c in value)
+
+    def reset_initialization_stage(self, name, allowed):
+        stage = self.root / name
+        if stage.is_symlink():
+            raise ValueError('Unsafe dataset initialization path')
+        if stage.exists():
+            if not stage.is_dir():
+                raise ValueError('Unsafe dataset initialization path')
+            for path in stage.iterdir():
+                if (not path.is_file() or path.is_symlink()
+                        or path.name not in allowed and not (
+                            path.name.endswith('.tmp')
+                            and any(path.name.startswith(f'.{filename}.') for filename in allowed))):
+                    raise ValueError('Unknown initialization files retained: ' + str(path))
+            shutil.rmtree(stage)  # Only this uncommitted stage, under the dataset lock.
+        stage.mkdir()
+        return stage
+
+    def write_empty_tasks(self, path):
+        pd.DataFrame({'task_index': pd.Series(dtype='int64')}).to_parquet(path)
+        with path.open('rb') as saved:
+            os.fsync(saved.fileno())
+
+    def recover_empty_metadata(self, pending):
+        """Repair an older initialization only when there are no committed data."""
+        meta = self.root / 'meta'
+        initial_files = {'info.json', 'robot.json', 'tasks.parquet'}
+        if (pending or meta.is_symlink() or any((meta / name).is_symlink() for name in initial_files)
+                or any(self.info.get(key) != 0 for key in ('total_episodes', 'total_frames', 'total_tasks'))
+                or any(path.name not in initial_files for path in meta.iterdir())
+                or any(path.exists() or path.is_symlink() for path in (self.root / 'data', self.root / 'videos'))):
+            raise ValueError('Missing or unreadable tasks.parquet for a nonempty dataset; files retained')
+        stage = self.reset_initialization_stage('.initializing-meta', initial_files)
+        self.write_empty_tasks(stage / 'tasks.parquet')
+        os.replace(stage / 'tasks.parquet', meta / 'tasks.parquet')
+        stage.rmdir()
+
+    def initialize_metadata(self, assets):
+        """Publish the complete initial metadata directory with one rename."""
+        target = self.root / 'meta'
+        if target.exists():
+            raise ValueError('Metadata directory exists without a committed info.json; files retained')
+        stage = self.reset_initialization_stage('.initializing-meta', {'robot.json', 'info.json', 'tasks.parquet'})
+        write_json(stage / 'robot.json', assets)
+        self.write_empty_tasks(stage / 'tasks.parquet')
+        write_json(stage / 'info.json', self.info)
+        os.replace(stage, target)
+
+    def episode_paths(self, episode):
+        chunk, index = divmod(episode, 1000)
+        paths = [self.info['data_path'].format(chunk_index=chunk, file_index=index),
+                 f'meta/episodes/chunk-{chunk:03d}/file-{index:03d}.parquet',
+                 f'meta/quality/episode-{episode:06d}.json']
+        paths += [self.info['video_path'].format(
+            video_key='observation.images.' + name, chunk_index=chunk, file_index=index)
+                  for name in CAMERAS]
+        return set(paths)
+
+    def prepare_commit(self, pairs, episode):
+        """Persist ownership and metadata backups BEFORE moving the first file."""
+        files = []
+        for source, target in pairs:
+            relative = target.relative_to(self.root).as_posix()
+            if target.is_symlink() or not target.resolve().is_relative_to(self.root):
+                raise ValueError('Unsafe dataset commit path')
+            files.append({'target': relative, 'sha256': file_hash(source)})
+        if {item['target'] for item in files} != self.episode_paths(episode):
+            raise ValueError('Incomplete dataset commit file set')
+        metadata = []
+        for name in ('tasks.parquet', 'stats.json', 'image_histograms.npz'):
+            target, backup = self.root / 'meta' / name, self.stage / ('before-' + name)
+            if target.exists():
+                shutil.copyfile(target, backup)
+                with backup.open('rb') as saved:
+                    os.fsync(saved.fileno())
+            metadata.append({'name': name, 'existed': target.exists(),
+                             'sha256': file_hash(backup) if backup.exists() else None})
+        write_json(self.stage / 'commit.json', {
+            'version': 1, 'episode': episode, 'previous_frames': self.info['total_frames'],
+            'files': files, 'metadata': metadata})
+
+    def recover_commit(self, stage):
+        """Keep a committed episode, or roll back this transaction for retransmit."""
+        journal = stage / 'commit.json'
+        if not journal.exists():
+            return  # Capture/encoding stopped before the transaction began.
+        value = json.loads(journal.read_text(encoding='utf-8'))
+        episode = value['episode']
+        if (value.get('version') != 1 or type(episode) is not int or episode < 0
+                or {item['target'] for item in value['files']} != self.episode_paths(episode)
+                or {item['name'] for item in value['metadata']}
+                != {'tasks.parquet', 'stats.json', 'image_histograms.npz'}):
+            raise ValueError('Invalid dataset recovery journal; files retained')
+        committed = episode < self.info['total_episodes']
+        if not committed and (episode != self.info['total_episodes']
+                              or value['previous_frames'] != self.info['total_frames']):
+            raise ValueError('Dataset commit marker differs from the recovery journal')
+        for item in value['files']:
+            target = self.root / item['target']
+            if target.is_symlink() or not target.resolve().is_relative_to(self.root):
+                raise ValueError('Unsafe dataset recovery path')
+            if target.exists():
+                if file_hash(target) != item['sha256']:
+                    raise ValueError('Recovery target changed; refusing to remove it: ' + str(target))
+            elif committed:
+                raise ValueError('Committed episode is missing a file: ' + str(target))
+        if committed:
+            return  # info.json was published; preserve the acknowledged episode.
+        # Restore through temporary files so another interruption can repeat recovery.
+        for item in value['metadata']:
+            target = self.root / 'meta' / item['name']
+            backup = stage / ('before-' + item['name'])
+            if item['existed']:
+                if file_hash(backup) != item['sha256']:
+                    raise ValueError('Dataset metadata backup is damaged; files retained')
+                temporary = target.with_name(target.name + '.recover')
+                shutil.copyfile(backup, temporary)
+                os.replace(temporary, target)
+            else:
+                target.unlink(missing_ok=True)
+        for item in value['files']:
+            (self.root / item['target']).unlink(missing_ok=True)
 
     def features(self):
         def vector(dtype, length, names=None):
@@ -195,11 +325,17 @@ class LeRobotV3Writer:
                          'video.is_depth_map': False, 'has_audio': False}}
         return result
 
-    def begin(self):
+    def begin(self, *, cache_id=None):
         if self.stage is not None:
             raise ValueError('An episode is already open')
-        self.stage = self.root / ('.pending-' + uuid4().hex)
-        self.stage.mkdir()
+        if cache_id is not None and not self.is_transfer_id(cache_id):
+            raise ValueError('Invalid episode cache identity')
+        pending = self.root / ('.pending-' + uuid4().hex)
+        stage = self.reset_initialization_stage('.initializing-episode', {'transfer.json'})
+        if cache_id is not None:
+            write_json(stage / 'transfer.json', {'cache_id': cache_id})
+        os.replace(stage, pending)
+        self.stage = pending
         self.rows = []
         self.origin_ns = None
         self.identity = None
@@ -250,7 +386,7 @@ class LeRobotV3Writer:
         relative = lambda t: (t - self.origin_ns) / 1e9
         action = list(capture.action)
         if self.size == 18:
-            action[14:] = checked_ternary_mobile_action(action[14:])
+            action[14:] = checked_mobile_action(action[14:])
         self.rows.append({'observation.state': list(capture.state), 'action': action,
                           'observation.source_time': relative(capture.stamp_ns),
                           'observation.camera_times': [relative(f.stamp_ns) for f in capture.images],
@@ -361,14 +497,38 @@ class LeRobotV3Writer:
             for stat, values in statistics.items():
                 metadata[f'stats/{key}/{stat}'] = values
         pq.write_table(pa.Table.from_pylist([metadata]), self.stage / 'episode.parquet')
+        quality = {'interruption': interruption,
+                   'video_encoding': 'JPEG staging during capture; H264 encoding on save',
+                   'video_encode_seconds': video_encode_seconds,
+                   'camera_time_semantics': 'host read completion, not exposure',
+                   'action_semantics': ACTION_SEMANTICS,
+                   'min_action_after_observation_s': min(
+                       min(row['action.sample_times']) - max(*row['observation.camera_times'],
+                                                              *row['observation.state_times']) for row in self.rows),
+                   'max_action_after_observation_s': max(
+                       max(row['action.sample_times']) - max(*row['observation.camera_times'],
+                                                               *row['observation.state_times']) for row in self.rows),
+                   'source_duration_s': self.rows[-1]['observation.source_time'],
+                   'nominal_duration_s': length / self.config['fps'],
+                   'fresh_fps': (length - 1) / max(1e-9, self.rows[-1]['observation.source_time']),
+                   'max_camera_skew_s': max(r['observation.camera_skew_s'] for r in self.rows),
+                   'max_sample_gap_s': max(np.diff([r['observation.source_time'] for r in self.rows])).item(),
+                   'calibration_ids': list(self.identity[0]), 'control_sessions': list(self.identity[1]),
+                   'image_stats': 'RGB 32x32 spatial samples every 10 frames'}
+        if transfer_id is not None:
+            quality.update(transfer_id=transfer_id, cache_sha256=transfer_sha256,
+                           episode=episode, frames=length, path=str(self.root))
+        write_json(self.stage / 'quality.json', quality)
         pairs = [(self.stage / 'data.parquet', data_path),
-                 (self.stage / 'episode.parquet', self.root / f'meta/episodes/chunk-{chunk:03d}/file-{file:03d}.parquet')]
+                 (self.stage / 'episode.parquet', self.root / f'meta/episodes/chunk-{chunk:03d}/file-{file:03d}.parquet'),
+                 (self.stage / 'quality.json', self.root / f'meta/quality/episode-{episode:06d}.json')]
         for name in CAMERAS:
             target = self.root / self.info['video_path'].format(
                 video_key='observation.images.' + name, chunk_index=chunk, file_index=file)
             pairs.append((self.stage / (name + '.mp4'), target))
         if any(target.exists() for _, target in pairs):
             raise ValueError('Destination file already exists; refusing to overwrite')
+        self.prepare_commit(pairs, episode)
         self.committing = True
         for source, target in pairs:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -397,32 +557,10 @@ class LeRobotV3Writer:
             stats['observation.images.' + name] = histogram_stats(self.hist[name], first + length)
         np.savez_compressed(self.stage / 'histograms.npz', **self.hist)
         os.replace(self.stage / 'histograms.npz', histogram_path)
-        json_write(self.root / 'meta/stats.json', stats)
-        quality = {'interruption': interruption,
-                   'video_encoding': 'JPEG staging during capture; H264 encoding on save',
-                   'video_encode_seconds': video_encode_seconds,
-                   'camera_time_semantics': 'host read completion, not exposure',
-                   'action_semantics': ACTION_SEMANTICS,
-                   'min_action_after_observation_s': min(
-                       min(row['action.sample_times']) - max(*row['observation.camera_times'],
-                                                              *row['observation.state_times']) for row in self.rows),
-                   'max_action_after_observation_s': max(
-                       max(row['action.sample_times']) - max(*row['observation.camera_times'],
-                                                               *row['observation.state_times']) for row in self.rows),
-                   'source_duration_s': self.rows[-1]['observation.source_time'],
-                   'nominal_duration_s': length / self.config['fps'],
-                   'fresh_fps': (length - 1) / max(1e-9, self.rows[-1]['observation.source_time']),
-                   'max_camera_skew_s': max(r['observation.camera_skew_s'] for r in self.rows),
-                   'max_sample_gap_s': max(np.diff([r['observation.source_time'] for r in self.rows])).item(),
-                   'calibration_ids': list(self.identity[0]), 'control_sessions': list(self.identity[1]),
-                   'image_stats': 'RGB 32x32 spatial samples every 10 frames'}
-        if transfer_id is not None:
-            quality.update(transfer_id=transfer_id, cache_sha256=transfer_sha256,
-                           episode=episode, frames=length, path=str(self.root))
-        json_write(self.root / f'meta/quality/episode-{episode:06d}.json', quality)
+        write_json(self.root / 'meta/stats.json', stats)
         self.info.update(total_episodes=episode + 1, total_frames=first + length,
                          total_tasks=len(self.tasks), splits={'train': f'0:{episode + 1}'})
-        json_write(self.root / 'meta/info.json', self.info)  # final commit marker
+        write_json(self.root / 'meta/info.json', self.info)  # final commit marker
         self.remove_stage()
         self.committing = False
         self.rows = []

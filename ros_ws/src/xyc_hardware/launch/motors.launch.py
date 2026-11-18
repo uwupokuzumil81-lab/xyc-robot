@@ -1,7 +1,7 @@
+from xyc.robot.profile import robot_profile
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
 
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
 from launch.substitutions import LaunchConfiguration
@@ -9,8 +9,7 @@ from launch_ros.actions import Node
 
 
 def motor_nodes(context):
-    package = Path(get_package_share_directory('xyc_hardware'))
-    parameters = str(package / 'config' / 'motors.yaml')
+    profile = robot_profile()
     calibrated = LaunchConfiguration('calibrated').perform(context) == 'true'
     group_mode = LaunchConfiguration('group_mode').perform(context) == 'true'
     auto_hold = LaunchConfiguration('auto_hold').perform(context) == 'true'
@@ -19,7 +18,6 @@ def motor_nodes(context):
     chassis_mode = LaunchConfiguration('chassis_mode').perform(context) == 'true'
     if group_mode and not calibrated:
         raise ValueError('Group control requires calibrated:=true')
-    streaming_control = group_mode and command_source in ('teleop', 'replay', 'policy')
     calibration_dir = Path(LaunchConfiguration('calibration_dir').perform(context)).expanduser()
     nodes = []
     for bus in ('left', 'right'):
@@ -28,10 +26,11 @@ def motor_nodes(context):
             executable='motor_state_node',
             name='motor_state',
             namespace=f'/motors/{bus}',
-            parameters=[parameters, {
+            parameters=[profile.motor_parameters(bus), {
                 'calibration_file': str(calibration_dir / f'{bus}.json') if calibrated else '',
                 'group_mode': group_mode,
                 'chassis_mode': chassis_mode and bus == 'left',
+                'command_source': command_source,
                 'gripper_torque_limit_raw': int(LaunchConfiguration(
                     'gripper_torque_limit_raw').perform(context)),
                 **({'poll_hz': 60.0, 'read_timeout_s': .014} if group_mode else {}),
@@ -44,7 +43,6 @@ def motor_nodes(context):
             package='xyc_hardware', executable='arm_group_coordinator',
             name='arm_group_coordinator', output='screen',
             parameters=[{'command_source': command_source,
-                         'streaming_targets': streaming_control,
                          'auto_hold': auto_hold}],
             on_exit=Shutdown(reason='arm coordinator process exited'),
         ))
@@ -68,7 +66,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'calibration_dir',
-            default_value=str(Path.home() / 'pi05_from_zero/config/calibration'),
+            default_value=str(robot_profile().robot_root / 'config/calibration'),
         ),
         OpaqueFunction(function=motor_nodes),
     ])

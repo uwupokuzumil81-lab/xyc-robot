@@ -6,7 +6,7 @@ import serial
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from xyc_hardware.arm_calibration import arm_names, denormalize_tick, normalize_tick
+from xyc.robot.calibration import arm_names, denormalize_tick, normalize_tick
 from xyc_hardware.arm_joint_control import (
     ArmBusHold, ArmBusTransaction, JointControl, JointDriver,
 )
@@ -53,6 +53,46 @@ class FakeJoint:
         self.torque = int(enabled)
         if enabled and self.fail_enable:
             raise OSError('enable reply lost')
+
+
+
+def inspect_target(control, position):
+    motor = control.driver
+    snapshot = (motor.read_coordinate_settings([motor.joint_id])[motor.joint_id],
+                motor.read_torque(), motor.read_joint())
+    return control.inspect_absolute_target(position, control_snapshot=snapshot)
+
+
+def apply_target(control, position):
+    """Exercise the real batch path with six other already-held fake joints."""
+    motor = control.driver
+    if not hasattr(motor, 'arm_group'):
+        side = motor.bus
+        entries = fixture(side)[2]['motors']
+        controls = {}
+        for name, entry in entries.items():
+            if entry['id'] == motor.joint_id:
+                controls[name] = control
+            else:
+                other = FakeJoint(entry)
+                other.bus = side
+                controls[name] = JointControl(other, entry, clock=control.clock)
+                controls[name].hold_current_position()
+        by_id = {item.driver.joint_id: item.driver for item in controls.values()}
+        def read_batch():
+            return {i: (m.read_coordinate_settings([i])[i], m.read_torque(), m.read_joint())
+                    for i, m in by_id.items()}
+        def write_batch(goals, *, deadline):
+            for i, tick in goals.items():
+                by_id[i].write_goal(tick)
+        motor.arm_group = ArmBusHold(
+            side, controls, max_prepare_age_s=1., clock=control.clock,
+            read_group_snapshot=read_batch, write_group_goals=write_batch)
+        motor.arm_group.state = 'holding'
+    group = motor.arm_group
+    targets = [normalize_tick(item.entry, item.target_ticks) for item in group.controls.values()]
+    targets[motor.joint_id - 1] = position
+    return group.apply_targets(targets)[motor.joint_id - 1]
 
 
 class TestTorqueOffConfirmation(unittest.TestCase):
@@ -119,8 +159,14 @@ class TestArmBusHold(unittest.TestCase):
                                  motor.read_torque(), motor.read_joint())
                 for motor in motors.values()
             }
+        def write_fake_group(goals, *, deadline):
+            if write_group_goals is not None:
+                return write_group_goals(goals)
+            for name, motor in motors.items():
+                if motor.joint_id in goals:
+                    motor.write_goal(goals[motor.joint_id])
         group = ArmBusHold('right', controls, max_prepare_age_s=1.0, clock=lambda: clock[0],
-                           write_group_goals=write_group_goals,
+                           write_group_goals=write_fake_group,
                            read_group_snapshot=read_group_snapshot)
         return group, motors, clock
 
@@ -136,6 +182,21 @@ class TestArmBusHold(unittest.TestCase):
             self.assertEqual(motor.writes, expected, name)
             self.assertTrue(group.controls[name].owned)
 
+    def test_expiry_at_the_serial_boundary_keeps_existing_arm_hold(self):
+        from xyc.contracts import CommandExpired
+        group, motors, _ = self.make_group()
+        group.prepare()
+        group.start()
+        group.write_group_goals = MagicMock(side_effect=CommandExpired('expired before port write'))
+        targets = [normalize_tick(c.entry, c.target_ticks) for c in group.controls.values()]
+        targets[0] += 2.
+        with self.assertRaisesRegex(ValueError, 'Target command expired'):
+            group.apply_targets(targets, deadline=.05)
+        self.assertEqual(group.write_group_goals.call_args.kwargs['deadline'], .05)
+        self.assertEqual(group.state, 'holding')
+        self.assertTrue(all(m.torque == 1 for m in motors.values()))
+        self.assertTrue(all(c.target_ticks == 2000 for c in group.controls.values()))
+
     def test_replay_margin_zero_accepts_recorded_endpoint_and_still_rejects_real_overrun(self):
         for joint, start, target in (
             ('elbow_flex', 97.80018, 99.35838),
@@ -150,14 +211,14 @@ class TestArmBusHold(unittest.TestCase):
                 motor.position = denormalize_tick(entry, start)
                 control = JointControl(motor, entry)
                 control.hold_current_position()
-                control.set_absolute_target(target)
+                apply_target(control, target)
                 self.assertEqual(control.target_ticks, denormalize_tick(entry, target))
                 self.assertEqual(motor.torque, 1)
                 before = list(motor.writes)
                 overrun = -0.01 if joint == 'gripper' else -100.01
                 for value in (overrun, 100.01):
                     with self.assertRaisesRegex(ValueError, 'normalization range'):
-                        control.inspect_absolute_target(value)
+                        inspect_target(control, value)
                 self.assertEqual(motor.writes, before)
 
     def test_absolute_goal_is_kept_in_full_until_the_servo_moves(self):
@@ -166,10 +227,10 @@ class TestArmBusHold(unittest.TestCase):
         control = JointControl(motor, entry)
         control.hold_current_position()
         before = list(motor.writes)
-        plan = control.inspect_absolute_target(80.)
+        plan = inspect_target(control, 80.)
         self.assertEqual(plan.target_ticks, 2800)
         self.assertEqual(motor.writes, before)
-        control.set_absolute_target(80.)
+        apply_target(control, 80.)
         self.assertEqual(motor.writes[-1], ('goal', 2800))
         self.assertEqual(control.target_ticks, 2800)
 
@@ -182,7 +243,7 @@ class TestArmBusHold(unittest.TestCase):
                 control = JointControl(motor, entry)
                 control.hold_current_position()
                 for target in targets:
-                    control.set_absolute_target(target)
+                    apply_target(control, target)
                     expected = denormalize_tick(entry, target)
                     self.assertEqual(control.target_ticks, expected)
                     self.assertEqual(motor.writes[-1], ('goal', expected))
@@ -197,7 +258,7 @@ class TestArmBusHold(unittest.TestCase):
         control.hold_current_position()
         before = list(motor.writes)
         with self.assertRaisesRegex(ValueError, 'encoder wrap'):
-            control.inspect_absolute_target(80.)
+            inspect_target(control, 80.)
         self.assertEqual(motor.writes, before)
 
     def test_preflight_failure_writes_nothing(self):
@@ -272,11 +333,40 @@ class TestArmBusHold(unittest.TestCase):
         self.assertEqual(motors[group.names[1]].torque, 1)
         self.assertEqual(motors[group.names[0]].torque, 0)
 
+    def test_protective_stop_releases_other_joints_even_if_one_cannot_be_verified(self):
+        group, motors, _ = self.make_group()
+        group.prepare()
+        group.start()
+        failed_name = group.names[2]
+        motors[failed_name].fail_release = True
+        with self.assertRaisesRegex(RuntimeError, 'torque-off unconfirmed'):
+            group.protective_release('teleop stopped')
+        self.assertEqual(group.state, 'fault')
+        self.assertIn(failed_name, group.reason)
+        for name, motor in motors.items():
+            self.assertEqual(motor.writes[-1], ('torque', False))
+            self.assertEqual(motor.torque, int(name == failed_name))
+
+    def test_protective_stop_cancels_a_queued_hold_commit(self):
+        group, motors, clock = self.make_group()
+        transaction = ArmBusTransaction(group, timeout_s=5., clock=lambda: clock[0])
+        transaction.prepare_hold('1')
+        transaction.protective_release('teleop stopped')
+        self.assertIsNone(transaction.pending)
+        self.assertEqual(group.state, 'fault')
+        with self.assertRaisesRegex(ValueError, 'No matching fresh hold'):
+            transaction.commit_hold('1')
+        with self.assertRaisesRegex(ValueError, 'not idle'):
+            transaction.prepare_hold('2')
+        self.assertTrue(all(not motor.writes for motor in motors.values()))
+
     def test_bus_identity_must_match(self):
         group, _, _ = self.make_group()
         group.controls[group.names[0]].driver.bus = 'left'
         with self.assertRaisesRegex(ValueError, 'identity'):
-            ArmBusHold('right', group.controls, max_prepare_age_s=1.0)
+            ArmBusHold('right', group.controls, max_prepare_age_s=1.0,
+                       write_group_goals=group.write_group_goals,
+                       read_group_snapshot=group.read_group_snapshot)
 
     def test_inspection_that_takes_too_long_is_not_prepared(self):
         group, motors, clock = self.make_group()
@@ -310,7 +400,7 @@ class TestArmBusHold(unittest.TestCase):
         group, motors, _ = self.make_group()
         group.prepare()
         group.start()
-        targets = [control.inspect_absolute_target(0.).current_normalized
+        targets = [inspect_target(control, 0.).current_normalized
                    for control in list(group.controls.values())[:6]] + [50.]
         targets[0] += 2.
         targets[-1] = float('nan')
@@ -400,53 +490,47 @@ class TestArmBusHold(unittest.TestCase):
         tx = ArmBusTransaction(group, timeout_s=.5, clock=lambda: clock[0])
         tx.prepare_hold('1')
         with self.assertRaises(ValueError):
-            tx.commit('99')
+            tx.commit_hold('99')
         tx.abort('1')
         with self.assertRaisesRegex(ValueError, 'already used'):
             tx.prepare_hold('1')
         tx.prepare_hold('2')
         clock[0] = .6
         with self.assertRaisesRegex(ValueError, 'matching'):
-            tx.commit('2')
+            tx.commit_hold('2')
         self.assertEqual(group.state, 'idle')
         self.assertTrue(all(not motor.writes for motor in motors.values()))
 
-    def test_transaction_freezes_targets_and_cannot_be_replayed(self):
+    def test_streamed_targets_are_written_once_and_cannot_be_replayed(self):
         group, motors, clock = self.make_group()
         tx = ArmBusTransaction(group, timeout_s=.5, clock=lambda: clock[0])
         tx.prepare_hold('1')
-        tx.commit('1')
-        plans = [control.inspect_absolute_target(0.) for control in list(group.controls.values())[:6]]
-        # Gripper uses 0..100 rather than -100..100.
-        gripper = group.controls[group.names[-1]].inspect_absolute_target(50.)
-        targets = [plan.current_normalized + 1. for plan in plans] + [gripper.current_normalized + 1.]
-        tx.prepare_targets('2', targets)
+        tx.commit_hold('1')
+        targets = [1.] * 6 + [51.]
+        tx.apply_stream_targets('2', targets, deadline=.5)
         targets[0] = 999.
-        tx.commit('2')
-        with self.assertRaisesRegex(ValueError, 'matching'):
-            tx.commit('2')
+        with self.assertRaisesRegex(ValueError, 'already used'):
+            tx.apply_stream_targets('2', targets, deadline=.5)
         self.assertTrue(all(motor.torque == 1 for motor in motors.values()))
         self.assertEqual(motors[group.names[0]].writes[-1], ('goal', 2010))
 
-    def test_group_keeps_the_full_goal_if_feedback_changes_before_commit(self):
+    def test_group_keeps_the_full_goal_with_different_measured_position(self):
         packets = []
         group, motors, clock = self.make_group(write_group_goals=packets.append)
         tx = ArmBusTransaction(group, timeout_s=.5, clock=lambda: clock[0])
         tx.prepare_hold('1')
-        tx.commit('1')
+        tx.commit_hold('1')
         wrist = motors[group.names[4]]
         targets = [0., 0., 0., 0., -18., 0., 50.]
-        tx.prepare_targets('2', targets)
         self.assertEqual(packets, [])
         wrist.position = 2070  # Now 25 units from the requested target.
-        tx.commit('2')
+        tx.apply_stream_targets('2', targets, deadline=.5)
         self.assertEqual(packets, [{wrist.joint_id: 1820}])
         self.assertEqual(group.controls[group.names[4]].target_ticks, 1820)
         self.assertEqual(wrist.torque, 1)
 
         targets[4] = -99.
-        tx.prepare_targets('3', targets)
-        tx.commit('3')
+        tx.apply_stream_targets('3', targets, deadline=.5)
         self.assertEqual(packets[-1], {wrist.joint_id: 1010})
 
     def test_group_keeps_full_gripper_goal_after_fresh_feedback(self):
@@ -454,12 +538,11 @@ class TestArmBusHold(unittest.TestCase):
         group, motors, clock = self.make_group(write_group_goals=packets.append)
         tx = ArmBusTransaction(group, timeout_s=.5, clock=lambda: clock[0])
         tx.prepare_hold('1')
-        tx.commit('1')
+        tx.commit_hold('1')
         gripper = motors[group.names[-1]]
         targets = [0.] * 6 + [43.]
-        tx.prepare_targets('2', targets)
         gripper.position = 2100  # Current 55, so the requested step grew from 7 to 12.
-        tx.commit('2')
+        tx.apply_stream_targets('2', targets, deadline=.5)
         self.assertEqual(packets, [{7: 1860}])  # Position 43, exactly the requested goal.
         self.assertEqual(gripper.torque, 1)
 
@@ -513,24 +596,22 @@ class TestArmBusHold(unittest.TestCase):
                 wrist = motors[group.names[4]]
                 wrist.position = position
                 tx.prepare_hold('1')
-                tx.commit('1')
-                tx.prepare_targets('2', [0., 0., 0., 0., target, 0., 50.])
+                tx.commit_hold('1')
                 original_read = wrist.read_joint
                 wrist.read_joint = lambda: dict(original_read(), velocity_raw=velocity, moving=True)
-                tx.commit('2')
+                tx.apply_stream_targets('2', [0., 0., 0., 0., target, 0., 50.], deadline=.5)
                 self.assertEqual(packets, [{wrist.joint_id: expected}])
 
-    def test_commit_does_not_reject_an_isolated_elbow_current_peak(self):
+    def test_stream_does_not_reject_an_isolated_elbow_current_peak(self):
         packets = []
         group, motors, clock = self.make_group(write_group_goals=packets.append)
         tx = ArmBusTransaction(group, timeout_s=.5, clock=lambda: clock[0])
         tx.prepare_hold('1')
-        tx.commit('1')
+        tx.commit_hold('1')
         elbow = motors[group.names[2]]
-        tx.prepare_targets('2', [0., 0., 6., 0., 0., 0., 50.])
         original_read = elbow.read_joint
         elbow.read_joint = lambda: dict(original_read(), current_a=.312, load_raw=504, moving=True)
-        tx.commit('2')
+        tx.apply_stream_targets('2', [0., 0., 6., 0., 0., 0., 50.], deadline=.5)
         self.assertEqual(packets, [{elbow.joint_id: 2060}])
         self.assertEqual(elbow.torque, 1)
         self.assertEqual(group.state, 'holding')
@@ -549,8 +630,8 @@ class TestContinuousJointProtection(unittest.TestCase):
         control.hold_current_position()
         read_joint = motor.read_joint
         motor.read_joint = lambda: dict(read_joint(), load_raw=384, current_a=0.208)
-        self.assertEqual(control.inspect_absolute_target(10.).target_ticks, 2100)
-        control.set_absolute_target(10.)
+        self.assertEqual(inspect_target(control, 10.).target_ticks, 2100)
+        apply_target(control, 10.)
         self.assertIsNone(control.observe(motor.read_joint()))
         clock[0] = 1 / 30
         self.assertIsNone(control.observe(read_joint()))
@@ -564,7 +645,7 @@ class TestContinuousJointProtection(unittest.TestCase):
             with self.subTest(moving=moving):
                 control, motor, clock = self.make_control()
                 control.hold_current_position()
-                control.set_absolute_target(20.)
+                apply_target(control, 20.)
                 for frame in range(20):
                     clock[0] = frame / 30
                     motor.position = 2000 + (4 * frame if moving else 0)
@@ -598,7 +679,7 @@ class TestContinuousJointProtection(unittest.TestCase):
     def test_high_load_timer_does_not_cross_a_feedback_gap(self):
         control, motor, clock = self.make_control()
         control.hold_current_position()
-        control.set_absolute_target(40.)
+        apply_target(control, 40.)
         loaded = dict(motor.read_joint(), load_raw=548, moving=True)
         self.assertIsNone(control.observe(loaded))
         clock[0] = .70
@@ -624,7 +705,10 @@ class TestContinuousJointProtection(unittest.TestCase):
         self.assertIsNone(control.observe(high))
         clock[0] = .022
         self.assertIsNone(control.observe(motor.read_joint()))
-        for timestamp in (.200, .300, .322, .344, .366):
+        self.assertIsNone(control.observe(high))
+        clock[0] = .100
+        self.assertIsNone(control.observe(motor.read_joint()))
+        for timestamp in (.300, .322, .344, .366):
             clock[0] = timestamp
             self.assertIsNone(control.observe(high))
         clock[0] = .388
@@ -632,6 +716,40 @@ class TestContinuousJointProtection(unittest.TestCase):
         self.assertEqual(result[0], 'error')
         self.assertIn('near-stall current', result[1])
         self.assertIn('limit 7.84 A', result[1])
+        self.assertEqual(motor.torque, 0)
+
+    def test_current_protection_still_trips_at_ten_hz_for_arms_and_grippers(self):
+        for joint, current, duration in (
+                ('elbow_flex', 8.5, .1), ('wrist_roll', 5., .1),
+                ('elbow_flex', 4.5, .7), ('wrist_roll', 2.9, .7),
+                ('gripper', 4., .2)):
+            with self.subTest(joint=joint, current=current):
+                control, motor, clock = self.make_control(joint)
+                control.hold_current_position()
+                high = dict(motor.read_joint(), current_a=current)
+                self.assertIsNone(control.observe(high))
+                for frame in range(1, round(duration * 10) + 1):
+                    clock[0] = frame / 10
+                    event = control.observe(high)
+                    if frame < round(duration * 10):
+                        self.assertIsNone(event)
+                self.assertEqual(event[0], 'error')
+                self.assertIn('current', event[1])
+                self.assertEqual(motor.torque, 0)
+
+    def test_low_current_clears_a_peak_and_long_high_current_gaps_cannot_hide_overload(self):
+        control, motor, clock = self.make_control('wrist_roll')
+        control.hold_current_position()
+        high = dict(motor.read_joint(), current_a=5.)
+        self.assertIsNone(control.observe(high))
+        clock[0] = .1
+        self.assertIsNone(control.observe(motor.read_joint()))
+        clock[0] = .2
+        self.assertIsNone(control.observe(high))
+        clock[0] = .5
+        event = control.observe(high)
+        self.assertEqual(event[0], 'error')
+        self.assertIn('monitoring lost', event[1])
         self.assertEqual(motor.torque, 0)
 
     def test_continuous_current_limits_depend_on_servo_model(self):
@@ -659,7 +777,7 @@ class TestContinuousJointProtection(unittest.TestCase):
     def test_gripper_contact_keeps_torque_and_reduces_closing_goal(self):
         control, motor, clock = self.make_control('gripper')
         control.hold_current_position()
-        control.set_absolute_target(40.)
+        apply_target(control, 40.)
         loaded = dict(motor.read_joint(), load_raw=384, current_a=.312, moving=True)
         for frame in range(5):
             clock[0] = frame / 30
@@ -673,7 +791,7 @@ class TestContinuousJointProtection(unittest.TestCase):
         control, motor, clock = self.make_control('wrist_yaw')
         motor.position = 1845
         control.hold_current_position()
-        self.assertEqual(control.set_absolute_target(-18.3).target_ticks, 1817)
+        self.assertEqual(apply_target(control, -18.3).target_ticks, 1817)
         return control, motor, clock
 
     def test_wrist_one_frame_overshoot_can_recover(self):
@@ -711,7 +829,7 @@ class TestContinuousJointProtection(unittest.TestCase):
         control, motor, clock = self.make_control('wrist_flex')
         motor.position = 1376
         control.hold_current_position()
-        self.assertEqual(control.set_absolute_target(-61.6).target_ticks, 1384)
+        self.assertEqual(apply_target(control, -61.6).target_ticks, 1384)
         # The previous move was still braking when a new, nearby goal arrived.
         for frame, (position, velocity) in enumerate(
                 [(1349, -1100), (1312, -1100), (1285, -750), (1271, -550)]):
@@ -735,7 +853,7 @@ class TestJointControl(unittest.TestCase):
         control = JointControl(motor, entry,
                                report_temperature_recheck=report)
         sample = dict(read_joint(), temperature_c=62.)
-        with patch('xyc_hardware.arm_joint_control.time.sleep') as pause:
+        with patch('xyc_hardware.motor_safety.time.sleep') as pause:
             control._validate_motion_sample(sample)
         self.assertEqual(pause.call_count, 5)
         self.assertTrue(all(call.args == (.01,) for call in pause.call_args_list))
@@ -758,7 +876,7 @@ class TestJointControl(unittest.TestCase):
                 report = MagicMock()
                 control = JointControl(motor, entry,
                                        report_temperature_recheck=report)
-                with patch('xyc_hardware.arm_joint_control.time.sleep'), self.assertRaisesRegex(
+                with patch('xyc_hardware.motor_safety.time.sleep'), self.assertRaisesRegex(
                         ValueError, 'temperature alarm not cleared'):
                     control._validate_motion_sample(dict(read_joint(), temperature_c=62.))
                 self.assertEqual(motor.read_temperature.call_count, 3)
@@ -818,14 +936,14 @@ class TestJointControl(unittest.TestCase):
         control = JointControl(motor, entry)
         control.hold_current_position()
         before = list(motor.writes)
-        self.assertEqual(control.set_absolute_target(0.).target_ticks, 2000)
+        self.assertEqual(apply_target(control, 0.).target_ticks, 2000)
         self.assertEqual(motor.writes, before)
-        self.assertEqual(control.set_absolute_target(2.).target_ticks, 2020)
+        self.assertEqual(apply_target(control, 2.).target_ticks, 2020)
         self.assertEqual(motor.writes[-1], ('goal', 2020))
         before = list(motor.writes)
         for invalid in (float('nan'), float('inf'), True, 100.01):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                control.set_absolute_target(invalid)
+                apply_target(control, invalid)
         self.assertEqual(motor.writes, before)
         self.assertEqual(motor.torque, 1)
 
@@ -834,9 +952,9 @@ class TestJointControl(unittest.TestCase):
         motor = FakeJoint(entry)
         control = JointControl(motor, entry)
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         self.assertEqual(motor.writes[-1], ('goal', 2020))
-        control.set_absolute_target(0.)
+        apply_target(control, 0.)
         self.assertEqual(motor.writes[-1], ('goal', 2000))
         self.assertEqual(motor.torque, 1)
 
@@ -845,14 +963,14 @@ class TestJointControl(unittest.TestCase):
         motor = FakeJoint(entry)
         control = JointControl(motor, entry)
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         before = list(motor.writes)
         self.assertTrue(control.busy)
-        self.assertEqual(control.set_absolute_target(2.).target_ticks, 2020)
+        self.assertEqual(apply_target(control, 2.).target_ticks, 2020)
         self.assertEqual(motor.writes, before)
         motor.torque = 0
         with self.assertRaisesRegex(ValueError, 'torque unexpectedly disabled'):
-            control.inspect_absolute_target(2.)
+            inspect_target(control, 2.)
         self.assertEqual(motor.writes, before)
 
     def test_full_calibrated_range_is_available_for_absolute_targets(self):
@@ -862,12 +980,12 @@ class TestJointControl(unittest.TestCase):
         control = JointControl(motor, entry)
         control.hold_current_position()
         before = list(motor.writes)
-        current = control.inspect_absolute_target(-99.8).current_normalized
-        control.set_absolute_target(current)
+        current = inspect_target(control, -99.8).current_normalized
+        apply_target(control, current)
         self.assertEqual(motor.writes, before)
-        control.set_absolute_target(-99.9)
+        apply_target(control, -99.9)
         self.assertEqual(motor.writes[-1], ('goal', 1001))
-        self.assertEqual(control.set_absolute_target(-99.).target_ticks, 1010)
+        self.assertEqual(apply_target(control, -99.).target_ticks, 1010)
         self.assertEqual(motor.torque, 1)
 
     def test_group_can_hold_unchanged_joint_at_boundary_margin(self):
@@ -877,10 +995,10 @@ class TestJointControl(unittest.TestCase):
         control = JointControl(motor, entry)
         plan = control.hold_current_position()
         before = list(motor.writes)
-        control.inspect_absolute_target(plan.current_normalized)
-        control.set_absolute_target(plan.current_normalized)
+        inspect_target(control, plan.current_normalized)
+        apply_target(control, plan.current_normalized)
         self.assertEqual(motor.writes, before)
-        control.set_absolute_target(99.9)
+        apply_target(control, 99.9)
         self.assertEqual(motor.writes[-1], ('goal', 2999))
 
     def test_persistent_hold_updates_without_releasing_or_reenabling(self):
@@ -889,7 +1007,7 @@ class TestJointControl(unittest.TestCase):
         now = [0.]
         control = JointControl(motor, entry, clock=lambda: now[0])
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         motor.position = 2020
         for _ in range(3):
             control.observe(motor.read_joint())
@@ -899,12 +1017,12 @@ class TestJointControl(unittest.TestCase):
         self.assertEqual(motor.torque, 1)
         now[0] = 10.
         self.assertIsNone(control.observe(motor.read_joint()))
-        plan = control.set_absolute_target(4.)
+        plan = apply_target(control, 4.)
         self.assertEqual(plan.target_ticks, 2040)
         self.assertEqual(sum(write == ('torque', True) for write in motor.writes), 1)
         self.assertNotIn(('torque', False), motor.writes)
         motor.position = 2030
-        control.set_absolute_target(5.)
+        apply_target(control, 5.)
         self.assertEqual(motor.writes[-1], ('goal', 2050))
         self.assertNotIn(('torque', False), motor.writes)
 
@@ -914,7 +1032,7 @@ class TestJointControl(unittest.TestCase):
         now = [0.]
         control = JointControl(motor, entry, clock=lambda: now[0])
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         sample = motor.read_joint()
         sample['current_a'] = 3.5
         self.assertIsNone(control.observe(sample))
@@ -926,7 +1044,7 @@ class TestJointControl(unittest.TestCase):
         self.assertEqual(motor.writes[-1], ('torque', False))
         self.assertTrue(control.fault)
         with self.assertRaises(ValueError):
-            control.set_absolute_target(2.)
+            apply_target(control, 2.)
 
     def test_holding_deviation_warns_after_three_samples_and_can_recover(self):
         entry = fixture('right')[2]['motors']['arm_right_wrist_roll']
@@ -980,9 +1098,9 @@ class TestJointControl(unittest.TestCase):
         now = [0.]
         control = JointControl(motor, entry, clock=lambda: now[0])
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         now[0] = 1.
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         now[0] = 1.6
         result = control.observe(motor.read_joint())
         self.assertEqual(result[0], 'warning')
@@ -1003,27 +1121,27 @@ class TestJointControl(unittest.TestCase):
         motor = FakeJoint(entry)
         control = JointControl(motor, entry)
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         motor.fail_goal_number = 3
-        with self.assertRaises(OSError):
-            control.set_absolute_target(4.)
+        with self.assertRaises(RuntimeError):
+            apply_target(control, 4.)
         self.assertEqual(motor.writes[-1], ('torque', False))
-        self.assertTrue(control.fault)
+        self.assertEqual(motor.arm_group.state, 'fault')
         with self.assertRaises(ValueError):
-            control.set_absolute_target(2.)
+            apply_target(control, 2.)
 
     def test_owned_goal_failure_reports_unconfirmed_release(self):
         entry = fixture('right')[2]['motors']['arm_right_wrist_roll']
         motor = FakeJoint(entry)
         control = JointControl(motor, entry)
         control.hold_current_position()
-        control.set_absolute_target(2.)
+        apply_target(control, 2.)
         motor.fail_goal_number = 3
         motor.fail_release = True
         with self.assertRaisesRegex(RuntimeError, 'torque-off unconfirmed'):
-            control.set_absolute_target(4.)
+            apply_target(control, 4.)
         self.assertTrue(control.owned)
-        self.assertTrue(control.fault)
+        self.assertEqual(motor.arm_group.state, 'fault')
 
     def test_all_arm_joints_use_their_own_calibration_and_selected_id(self):
         for arm in ('left', 'right'):
@@ -1035,7 +1153,7 @@ class TestJointControl(unittest.TestCase):
                     controller = JointControl(motor, entry)
                     self.assertEqual(motor.writes, [])
                     controller.hold_current_position()
-                    plan = controller.set_absolute_target(normalize_tick(entry, motor.position) + 1.)
+                    plan = apply_target(controller, normalize_tick(entry, motor.position) + 1.)
                     expected_ticks = 2020 if name.endswith('_gripper') else 2010
                     self.assertEqual(plan.target_ticks, expected_ticks)
                     expected = [('torque_limit', 100)] if name.endswith('_gripper') else []
@@ -1067,14 +1185,14 @@ class TestJointControl(unittest.TestCase):
         clock = [0.]
         control = JointControl(motor, entry, clock=lambda: clock[0])
         control.hold_current_position()
-        control.set_absolute_target(1.)
+        apply_target(control, 1.)
         motor.fail_release = True
         self.assertEqual(control.observe(None)[0], 'warning')
         clock[0] = .21
         self.assertIn('UNCONFIRMED', control.observe(None)[1])
         self.assertTrue(control.owned)
         with self.assertRaises(ValueError):
-            control.set_absolute_target(-1.)
+            apply_target(control, -1.)
 
     def test_transport_only_permits_selected_joint_and_profile(self):
         for bus in ('left', 'right'):
@@ -1082,7 +1200,7 @@ class TestJointControl(unittest.TestCase):
                 serial = MagicMock()
                 serial.write.side_effect = len
                 ids = list(range(1, 12 if bus == 'left' else 8))
-                with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+                with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
                     driver = JointDriver('/unused', ids, bus=bus, joint_id=joint_id)
                 for other in ({1, 2, 6, 7, 8, 11, 254} - {joint_id}):
                     with self.assertRaises(ValueError):
@@ -1100,7 +1218,7 @@ class TestJointControl(unittest.TestCase):
     def test_failed_profile_readback_is_not_accepted(self):
         serial = MagicMock()
         serial.write.side_effect = len
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
             driver = JointDriver('/unused', list(range(1, 8)), bus='right', joint_id=5)
         with patch.object(driver, '_receive', return_value={}), \
              patch.object(driver, '_read_joint_register', return_value=b'bad'):
@@ -1110,7 +1228,7 @@ class TestJointControl(unittest.TestCase):
     def test_missing_register_reply_retries_reads_without_repeating_a_write(self):
         serial = MagicMock()
         serial.write.side_effect = len
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
             driver = JointDriver('/unused', list(range(1, 8)), bus='right', joint_id=2)
         reply = SimpleNamespace(servo_error=0, data=b'\x01')
         with patch.object(driver, '_receive', side_effect=[{}, {2: reply}]):
@@ -1133,7 +1251,7 @@ class TestJointControl(unittest.TestCase):
     def test_group_preflight_retries_transmit_timeout_without_writing_goals(self):
         port = MagicMock()
         port.write.side_effect = [serial.SerialTimeoutException('Write timeout'), 15]
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=port):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=port):
             driver = JointDriver('/unused', list(range(1, 8)), bus='right', joint_id=2)
         data = bytearray(40)
         data[9] = 1
@@ -1150,7 +1268,7 @@ class TestJointControl(unittest.TestCase):
         for instruction, attempts in ((0x82, 2), (0x83, 1), (3, 1)):
             port = MagicMock()
             port.write.side_effect = serial.SerialTimeoutException('Write timeout')
-            with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=port):
+            with patch('xyc.robot.feetech.serial.Serial', return_value=port):
                 driver = JointDriver('/unused', list(range(1, 8)), bus='right', joint_id=2)
             with self.assertRaisesRegex(serial.SerialTimeoutException, 'right ID.*transmission timed out'):
                 driver._send_joint_packet(2, instruction, b'\x28\x01')
@@ -1158,7 +1276,7 @@ class TestJointControl(unittest.TestCase):
     def test_group_packets_and_target_readback_use_continuous_profile(self):
         serial = MagicMock()
         serial.write.side_effect = len
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
             driver = JointDriver('/unused', list(range(1, 12)), bus='left', joint_id=1)
         with self.assertRaises(ValueError):
             driver.write_arm_goals({8: 2000})

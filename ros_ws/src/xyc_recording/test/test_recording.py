@@ -17,8 +17,12 @@ import cv2
 import numpy as np
 import pyarrow.parquet as pq
 
-from xyc_recording.alignment import ACTION_SEMANTICS, ARM_NAMES, CAMERAS, CameraFrame, Capture, CaptureBuffer
-from xyc_recording.writer import LeRobotV3Writer, acquire_dataset_lock, checked_config
+from xyc.contracts import ACTION_SEMANTICS
+from xyc.recording.alignment import Capture, CaptureBuffer
+from xyc.contracts import ARM_NAMES, CAMERAS
+from xyc.observation import CameraFrame, ObservationBuffer
+from xyc.recording.writer import LeRobotV3Writer, acquire_dataset_lock
+from xyc.recording.config import checked_config
 
 
 def arm(side, stamp, *, target=12., mobile=True):
@@ -40,7 +44,7 @@ def jpeg(value):
 def command(kind, stamp, sequence=None, *, target=30., accepted=None):
     event = {'kind': kind, 'sequence': sequence or stamp, 'generated_ns': stamp,
              'sent_ns': stamp + 500_000, 'accepted_ns': accepted or stamp + 1_000_000,
-             'targets': [target] * 14 if kind == 'arms' else [.015, .15, 0., .60]}
+             'targets': [target] * 14 if kind == 'arms' else [1, 1, 0, 1]}
     if kind == 'arms':
         event.update(calibration_ids=['a' * 64, 'b' * 64], sessions=['left-session', 'right-session'])
     else:
@@ -59,6 +63,19 @@ def capture(index, origin=1_000_000_000):
 
 
 class TestAlignment(unittest.TestCase):
+    def test_live_and_recording_share_identical_observation_pairing(self):
+        recording = self.ready()
+        live = ObservationBuffer()
+        for name, history in recording.cameras.items():
+            for frame in history:
+                live.add_camera(name, frame.stamp_ns, frame.jpeg)
+        for side, history in recording.arms.items():
+            for state in history:
+                live.add_arm(side, state)
+        observation, capture = live.pick(1_020_000_000), recording.pick(1_020_000_000)
+        for key in ('stamp_ns', 'images', 'state', 'state_stamps_ns', 'calibration_ids', 'sessions', 'camera_skew_s'):
+            self.assertEqual(getattr(observation, key), getattr(capture, key))
+
     def ready(self, mobile=True):
         buffer = CaptureBuffer()
         for side in ('left', 'right'):
@@ -183,6 +200,14 @@ class TestAlignment(unittest.TestCase):
         with self.assertRaises(ValueError):
             buffer.add_command(bad)
 
+    def test_physical_velocity_event_is_rejected_before_pairing(self):
+        buffer = self.ready()
+        bad = command('mobile', 1_030_000_000, 3)
+        bad['targets'] = [.015, .15, 0., .60]
+        with self.assertRaisesRegex(ValueError, r'exactly -1, 0 or \+1'):
+            buffer.add_command(bad)
+        self.assertEqual(buffer.commands['mobile'][-1]['sequence'], 2)
+
 
 class TestV3Writer(unittest.TestCase):
     def setUp(self):
@@ -201,6 +226,103 @@ class TestV3Writer(unittest.TestCase):
         for index in range(count):
             writer.add(capture(index))
         return writer.save()
+
+    def test_initial_metadata_is_atomic_and_every_interrupted_phase_can_resume(self):
+        import xyc.recording.writer as module
+        for phase in ('robot', 'tasks', 'info', 'publish', 'after_publish'):
+            with self.subTest(phase=phase):
+                config = {**self.config, 'dataset': 'xyc/init_' + phase}
+                root = self.base / config['dataset']
+                original_json, original_parquet, original_replace = module.write_json, module.pd.DataFrame.to_parquet, module.os.replace
+                def write_json(path, value):
+                    if Path(path).name == phase + '.json':
+                        raise OSError('injected ' + phase)
+                    return original_json(path, value)
+                def parquet(frame, path, *args, **kwargs):
+                    if phase == 'tasks':
+                        raise OSError('injected tasks')
+                    return original_parquet(frame, path, *args, **kwargs)
+                def publish(source, target):
+                    if Path(source).name == '.initializing-meta' and phase == 'publish':
+                        raise OSError('injected publish')
+                    result = original_replace(source, target)
+                    if Path(source).name == '.initializing-meta' and phase == 'after_publish':
+                        raise OSError('injected after_publish')
+                    return result
+                with patch.object(module, 'write_json', write_json), \
+                        patch.object(module.pd.DataFrame, 'to_parquet', parquet), \
+                        patch.object(module.os, 'replace', publish):
+                    with self.assertRaisesRegex(OSError, 'injected'):
+                        LeRobotV3Writer(self.base, config, width=16, height=16)
+                self.assertEqual((root / 'meta').exists(), phase == 'after_publish')
+                writer = LeRobotV3Writer(self.base, {**config, 'resume': True}, width=16, height=16)
+                try:
+                    self.assertEqual(writer.info['total_episodes'], 0)
+                    self.assertTrue(all((root / 'meta' / name).is_file()
+                                        for name in ('robot.json', 'info.json', 'tasks.parquet')))
+                    self.assertFalse((root / '.initializing-meta').exists())
+                    self.record(writer, 2)
+                    self.assertEqual(writer.info['total_episodes'], 1)
+                finally:
+                    writer.close()
+
+    def test_unknown_initialization_files_are_preserved(self):
+        stage = self.base / self.config['dataset'] / '.initializing-meta'
+        stage.mkdir(parents=True)
+        kept = stage / 'keep.txt'
+        kept.write_text('not an initialization file')
+        with self.assertRaisesRegex(ValueError, 'Unknown initialization'):
+            self.writer(resume=True)
+        self.assertEqual(kept.read_text(), 'not an initialization file')
+
+    def test_resume_repairs_only_empty_legacy_metadata_and_pending_directories(self):
+        writer = self.writer()
+        root = writer.root
+        writer.close()
+        orphan = root / ('.pending-' + 'a' * 32)
+        orphan.mkdir()
+        tasks = root / 'meta/tasks.parquet'
+        tasks.unlink()
+        writer = self.writer(resume=True)
+        try:
+            self.assertFalse(orphan.exists())
+            self.record(writer, 2)
+        finally:
+            writer.close()
+        tasks.unlink()
+        with self.assertRaisesRegex(ValueError, 'nonempty dataset'):
+            self.writer(resume=True)
+        self.assertFalse(tasks.exists())
+
+    def test_transfer_marker_failure_leaves_no_published_episode_and_can_retry(self):
+        writer = self.writer()
+        root = writer.root
+        with patch('xyc.recording.writer.write_json', side_effect=OSError('injected marker failure')):
+            with self.assertRaisesRegex(OSError, 'injected marker failure'):
+                writer.begin(cache_id='e' * 32)
+        self.assertFalse(list(root.glob('.pending-*')))
+        writer.close()
+        writer = self.writer(resume=True)
+        try:
+            writer.begin(cache_id='e' * 32)
+            self.assertEqual(json.loads((writer.stage / 'transfer.json').read_text()), {'cache_id': 'e' * 32})
+            for i in range(2):
+                writer.add(capture(i))
+            self.assertEqual(writer.save()['frames'], 2)
+        finally:
+            writer.close()
+
+    def test_resume_restores_truncated_empty_task_index(self):
+        writer = self.writer()
+        tasks = writer.root / 'meta/tasks.parquet'
+        writer.close()
+        tasks.write_bytes(b'PAR1')
+        writer = self.writer(resume=True)
+        try:
+            self.assertTrue(writer.tasks.empty)
+            self.record(writer, 2)
+        finally:
+            writer.close()
 
     def test_v3_layout_video_frame_counts_stats_resume_and_tasks(self):
         writer = self.writer()
@@ -256,7 +378,7 @@ class TestV3Writer(unittest.TestCase):
         root = writer.root
         writer.close()
         script = ('import os, sys; from pathlib import Path; '
-                  'from xyc_recording.writer import acquire_dataset_lock; '
+                  'from xyc.recording.writer import acquire_dataset_lock; '
                   'fd = acquire_dataset_lock(Path(sys.argv[1])); os._exit(0)')
         result = subprocess.run([sys.executable, '-c', script, str(root / '.writer.lock')],
                                 capture_output=True, timeout=30)
@@ -385,3 +507,73 @@ class TestV3Writer(unittest.TestCase):
                 self.assertEqual(tuple(rgb.shape), (3, 16, 16))
                 self.assertGreater(float(rgb[0].mean()), .7)
         self.assertTrue(dataset[4]['action_is_pad'][1:].all())
+
+
+class TestCommitRecovery(unittest.TestCase):
+    def test_interrupted_commit_rolls_back_only_its_episode_and_retransmits(self):
+        from xyc.recording import writer as module
+        points = ['meta/episodes/chunk-000/file-001.parquet',
+                  'videos/observation.images.wrist_left/chunk-000/file-001.mp4',
+                  'meta/tasks.parquet', 'meta/stats.json', 'meta/info.json']
+        for point in points:
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as directory:
+                config = {'dataset': 'xyc/recovery', 'task': 'test', 'resume': True}
+                cache_id = 'a' * 32
+                writer = LeRobotV3Writer(directory, config, width=16, height=16)
+                writer.begin()
+                for i in range(2): writer.add(capture(i))
+                writer.save()
+                before = {name: (writer.root / 'meta' / name).read_bytes()
+                          for name in ('tasks.parquet', 'stats.json', 'image_histograms.npz')}
+                writer.begin(cache_id=cache_id)
+                for i in range(2): writer.add(capture(i))
+                original = os.replace
+                def interrupted(source, target):
+                    if Path(target) == writer.root / point:
+                        raise OSError('injected commit interruption')
+                    return original(source, target)
+                try:
+                    with patch.object(module.os, 'replace', side_effect=interrupted):
+                        with self.assertRaisesRegex(OSError, 'injected'):
+                            writer.save(transfer_id=cache_id, transfer_sha256='digest')
+                finally:
+                    writer.close()
+                if point == 'meta/tasks.parquet':
+                    (writer.root / point).unlink()
+                restored = LeRobotV3Writer(directory, config, width=16, height=16,
+                                           recover_transfer_id=cache_id)
+                try:
+                    self.assertEqual(restored.info['total_episodes'], 1)
+                    self.assertFalse((restored.root / 'data/chunk-000/file-001.parquet').exists())
+                    for name, previous in before.items():
+                        self.assertEqual((restored.root / 'meta' / name).read_bytes(), previous)
+                    restored.begin()
+                    for i in range(2): restored.add(capture(i))
+                    self.assertEqual(restored.save(transfer_id=cache_id)['episode'], 1)
+                    self.assertEqual(restored.info['total_frames'], 4)
+                finally:
+                    restored.close()
+
+    def test_committed_marker_survives_failure_to_remove_staging(self):
+        from xyc.recording import writer as module
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'dataset': 'xyc/recovery', 'task': 'test', 'resume': True}
+            cache_id = 'b' * 32
+            writer = LeRobotV3Writer(directory, config, width=16, height=16)
+            writer.begin()
+            module.write_json(writer.stage / 'transfer.json', {'cache_id': cache_id})
+            for i in range(2): writer.add(capture(i))
+            try:
+                with patch.object(writer, 'remove_stage', side_effect=OSError('cleanup interrupted')):
+                    with self.assertRaises(OSError):
+                        writer.save(transfer_id=cache_id, transfer_sha256='digest')
+            finally:
+                writer.close()
+            restored = LeRobotV3Writer(directory, config, width=16, height=16,
+                                       recover_transfer_id=cache_id)
+            try:
+                self.assertEqual(restored.info['total_episodes'], 1)
+                self.assertEqual(len(list((restored.root / 'data').glob('chunk-*/*.parquet'))), 1)
+                self.assertFalse(list(restored.root.glob('.pending-*')))
+            finally:
+                restored.close()

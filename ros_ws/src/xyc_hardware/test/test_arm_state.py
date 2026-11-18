@@ -43,7 +43,7 @@ class TestArmState(unittest.TestCase):
             wheel.valid = False
             message.motors.insert(0, wheel)
             message.motors.reverse()
-            with patch('xyc_hardware.feetech_reader.serial.Serial') as port:
+            with patch('xyc.robot.feetech.serial.Serial') as port:
                 state = converter.convert(message)
             port.assert_not_called()
             self.assertEqual(state.names, list(spec['motors']))

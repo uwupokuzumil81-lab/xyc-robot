@@ -1,5 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
 """Bounded, acknowledged recording transport. No filesystem or motor access."""
+
+from xyc.robot.profile import robot_profile
+# SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
 from dataclasses import dataclass
@@ -11,10 +13,12 @@ import threading
 import time
 from uuid import uuid4
 
-from .alignment import CAMERAS, CameraFrame, Capture
+from xyc.contracts import CAMERAS
+from xyc.observation import CameraFrame
+from .alignment import Capture
 
 
-STREAM_PORT = 17884  # Loopback only; desktop accesses it through preview port 17883.
+STREAM_PORT = robot_profile().ports['recording']  # Loopback only; desktop accesses it through the configured data port.
 MAX_HEADER = 65536
 MAX_PACKET = 4 * 2 * 1024 * 1024 + MAX_HEADER + 4
 
@@ -188,7 +192,7 @@ class CaptureRelay:
                     raise RecordingBackpressure('电脑数据接收跟不上，传输缓存已满；保存已接收前段')
                 self.condition.wait(.05)
             if self.closed or not self.alive():
-                raise ConnectionError('电脑采集数据通道未连接，请保留 SSH 的17883端口转发')
+                raise ConnectionError(f"电脑采集数据通道未连接，请保留 SSH 的{robot_profile().ports['data']}端口转发")
             pending = Pending(self.sequence, operation, packet, threading.Event())
             self.queue.append(pending)
             self.bytes += len(packet)

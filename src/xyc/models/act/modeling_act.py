@@ -22,7 +22,6 @@ The majority of changes here involve removing unused code, unifying naming, and 
 """
 
 import math
-from collections import deque
 from collections.abc import Callable
 from itertools import chain
 
@@ -36,7 +35,7 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .configuration_act import ACTConfig
-from xyc.learning.contracts import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from xyc.contracts import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
 class ACTPolicy(nn.Module):
@@ -94,33 +93,6 @@ class ACTPolicy(nn.Module):
         """This should be called whenever the environment is reset."""
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
-        else:
-            self._action_queue = deque([], maxlen=self.config.n_action_steps)
-
-    @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations.
-
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
-        queue is empty.
-        """
-        self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
-
-        if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
-            action = self.temporal_ensembler.update(actions)
-            return action
-
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:

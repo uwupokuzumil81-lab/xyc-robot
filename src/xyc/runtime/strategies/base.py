@@ -27,6 +27,17 @@ class ActionSelection:
 Predict = Callable[..., Prediction]
 
 
+@dataclass(frozen=True)
+class ChunkExecutionSpec:
+    action_steps: int
+    horizon: int
+    ensemble: bool = False
+
+    def __post_init__(self):
+        if not 1 <= self.action_steps <= self.horizon:
+            raise ValueError('Chunk execution needs 1 <= action_steps <= horizon')
+
+
 class InferenceStrategy:
     """Interface shared by synchronous chunks, ensembling and RTC."""
 

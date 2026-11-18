@@ -19,7 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .checkpoint import json_write
+from xyc.io import write_json
 
 
 def utc_now():
@@ -65,7 +65,7 @@ class InferenceRecorder:
             'queue': {'max_events': max_queue, 'max_bytes': max_bytes},
         }
         self.path.mkdir(parents=True, exist_ok=False)
-        json_write(self.path / 'meta.json', self._metadata)
+        write_json(self.path / 'meta.json', self._metadata)
         if record_video:
             (self.path / 'videos').mkdir()
         self._thread = threading.Thread(target=self._work, name='xyc-inference-writer', daemon=True)
@@ -331,7 +331,7 @@ class InferenceRecorder:
                         'missing': dict(missing), 'writer_error': self._error,
                         'video_frames_per_camera': self._video_count, 'video_shapes': self._video_shapes}
         try:
-            json_write(self.path / 'meta.json', self.summary)
+            write_json(self.path / 'meta.json', self.summary)
         except OSError as exc:
             self.summary.update(status='logging_failed', writer_error=str(exc))
             logging.getLogger(__name__).error('Could not finalize inference metadata: %s', exc)

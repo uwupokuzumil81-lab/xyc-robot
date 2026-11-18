@@ -1,8 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
 """Exclusive model-policy backend using the same arm, chassis and safety controllers."""
 
+from xyc.robot.profile import robot_profile
+# SPDX-License-Identifier: Apache-2.0
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, Shutdown
 from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -11,9 +13,8 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def acquire_backend(context):
-    from pathlib import Path
-    from xyc_hardware.teleop_transport import BackendLease
-    lease = BackendLease(Path.home() / 'pi05_from_zero')
+    from xyc.transport.lease import BackendLease
+    lease = BackendLease(robot_profile().robot_root)
     lease.acquire(with_motors=True, with_cameras=True, recording=False)
     context.register_event_handler(
         OnShutdown(on_shutdown=[OpaqueFunction(function=lambda context: lease.close())]))
@@ -38,5 +39,6 @@ def generate_launch_description():
             }.items()),
         Node(
             package='xyc_hardware', executable='motion_replay', name='policy_control',
-            parameters=[{'command_source': 'policy'}], output='screen'),
+            parameters=[{'command_source': 'policy'}], output='screen',
+            on_exit=Shutdown(reason='motion control process exited')),
     ])

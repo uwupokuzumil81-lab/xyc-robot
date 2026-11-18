@@ -1,40 +1,4 @@
 /robot/observation_node:
   ros__parameters:
-    camera_names: [forward, chest, wrist_left, wrist_right]
-    camera_topics:
-      - /camera/forward/image_raw
-      - /camera/chest/image_raw
-      - /camera/wrist_left/image_raw
-      - /camera/wrist_right/image_raw
-    camera_frame_ids:
-      - camera_forward_optical_frame
-      - camera_chest_optical_frame
-      - camera_wrist_left_optical_frame
-      - camera_wrist_right_optical_frame
-    state_topics: [/motors/left/state, /motors/right/state]
-    mobile_state_topic: /robot/chassis/state
-    mobile_frame_id: base_link
-    joint_names:
-      - arm_left_shoulder_pan
-      - arm_left_shoulder_lift
-      - arm_left_elbow_flex
-      - arm_left_wrist_flex
-      - arm_left_wrist_yaw
-      - arm_left_wrist_roll
-      - arm_left_gripper
-      - arm_right_shoulder_pan
-      - arm_right_shoulder_lift
-      - arm_right_elbow_flex
-      - arm_right_wrist_flex
-      - arm_right_wrist_yaw
-      - arm_right_wrist_roll
-      - arm_right_gripper
-    width: 640
-    height: 480
     encoding: bgr8
     publish_hz: 30.0
-    sync_queue_size: 8
-    sync_slop_s: 0.04
-    max_time_skew_s: 0.05
-    max_age_s: 0.25
-    future_tolerance_s: 0.02

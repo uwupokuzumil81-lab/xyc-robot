@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate feedback and map leader positions to complete calibrated targets."""
 
-from xyc_hardware.arm_calibration import arm_names
-from xyc_hardware.teleop_transport import MAX_SAMPLE_AGE, SIDES, check_arm_positions
+from xyc.robot.calibration import arm_names
+from xyc.transport.teleop import MAX_SAMPLE_AGE, SIDES, check_arm_positions
 
 
 def stamp_ns(msg):

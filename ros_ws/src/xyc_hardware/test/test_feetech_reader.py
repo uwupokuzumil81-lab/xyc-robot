@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import serial
 
-from xyc_hardware.feetech_reader import FeetechReader, Reply, decode_feedback
+from xyc.robot.feetech import FeetechReader, Reply, decode_feedback
 from xyc_hardware.arm_joint_control import JointControl
 
 
@@ -28,7 +28,7 @@ class FakeSerial:
 class TestReadOnlyProtocol(unittest.TestCase):
     def reader(self, chunks):
         fake = FakeSerial(chunks)
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=fake):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=fake):
             reader = FeetechReader('/unused', [1], timeout_s=0.002, clock_ns=lambda: 123)
         return reader, fake
 
@@ -51,7 +51,7 @@ class TestReadOnlyProtocol(unittest.TestCase):
         self.assertEqual(fake.writes[0][4], 0x82)
 
     def test_serial_write_budget_is_independent_of_feedback_poll_period(self):
-        with patch('xyc_hardware.feetech_reader.serial.Serial') as serial_class:
+        with patch('xyc.robot.feetech.serial.Serial') as serial_class:
             FeetechReader('/unused', [1], timeout_s=.014)
         self.assertEqual(serial_class.call_args.kwargs['write_timeout'], .05)
         self.assertEqual(serial_class.call_args.kwargs['timeout'], 0)

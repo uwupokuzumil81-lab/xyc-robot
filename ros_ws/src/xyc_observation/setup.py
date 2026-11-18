@@ -11,7 +11,7 @@ setup(
         ('share/xyc_observation/config', glob('config/*.yaml')),
         ('share/xyc_observation/launch', glob('launch/*.launch.py')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'xyc-robot>=0.2'],
     maintainer='pi5', maintainer_email='pi5@todo.todo', license='Apache-2.0',
     description='Validated live observations from four cameras and the 18-D robot state',
     extras_require={'test': ['pytest']},

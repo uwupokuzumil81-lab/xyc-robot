@@ -1,28 +1,29 @@
 """Read-only four-camera browser preview, accessed through an SSH forward."""
 
 from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import socket
 import struct
-from pathlib import Path
 import threading
 import time
 from urllib.parse import urlsplit
 
 from ament_index_python.packages import get_package_share_directory
-import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
+import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
+from xyc.robot.profile import robot_profile
 
 
 CAMERAS = {'forward': '前方', 'chest': '胸前',
            'wrist_left': '左腕', 'wrist_right': '右腕'}
-PREVIEW_STREAM_FPS = 15.0
+PREVIEW_STREAM_FPS = robot_profile().preview_fps
 
 
 class FrameHub:
@@ -33,7 +34,6 @@ class FrameHub:
         self.condition = threading.Condition()
         self.frames = {}
         self.arrivals = {name: deque(maxlen=90) for name in CAMERAS}
-        self.viewers = {name: 0 for name in CAMERAS}
         self.closed = False
 
     def push(self, name, data, stamp_ns=None):
@@ -63,14 +63,6 @@ class FrameHub:
                 return None
             return frame
 
-    def watch(self, name, change):
-        with self.condition:
-            self.viewers[name] += change
-
-    def watched(self):
-        with self.condition:
-            return {name for name, count in self.viewers.items() if count > 0}
-
     def latest(self, name):
         with self.condition:
             return self.frames.get(name)
@@ -99,9 +91,10 @@ class PreviewServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, hub, page, recording_address=('127.0.0.1', 17884)):
+    def __init__(self, address, hub, page, recording_address=None):
         self.hub, self.page = hub, page
-        self.recording_address = recording_address
+        self.recording_address = recording_address or (
+            '127.0.0.1', robot_profile().ports['recording'])
         super().__init__(address, PreviewHandler)
 
 
@@ -145,7 +138,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        """Recording bytes have their own HTTP connection, separate from control."""
+        """Relay recording bytes over a separate HTTP connection."""
         path = urlsplit(self.path).path
         if path not in ('/api/recording/exchange', '/api/recording/heartbeat'):
             self.send_error(404)
@@ -170,7 +163,8 @@ class PreviewHandler(BaseHTTPRequestHandler):
             if len(data) != size:
                 raise ValueError('Incomplete recording response')
             self.send_response(response.status)
-            self.send_header('Content-Type', response.getheader('Content-Type', 'application/octet-stream'))
+            self.send_header(
+                'Content-Type', response.getheader('Content-Type', 'application/octet-stream'))
             self.send_header('Content-Length', str(size))
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
@@ -194,28 +188,25 @@ class PreviewHandler(BaseHTTPRequestHandler):
         previous = 0
         next_frame_at = 0.0
         hub = self.server.hub
-        hub.watch(name, 1)
-        try:
-            while not hub.closed:
-                delay = next_frame_at - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                frame = hub.wait(name, previous)
-                if frame is None:
-                    # MIME whitespace detects closed clients without presenting
-                    # an invalid image part to a browser waiting for its first JPEG.
-                    self.wfile.write(b'\r\n')
-                else:
-                    previous, data = frame
-                    next_frame_at = time.monotonic() + 1.0 / PREVIEW_STREAM_FPS
-                    self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
-                                     + str(len(data)).encode() + b'\r\n\r\n' + data + b'\r\n')
-                self.wfile.flush()
-        finally:
-            hub.watch(name, -1)
+        while not hub.closed:
+            delay = next_frame_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            frame = hub.wait(name, previous)
+            if frame is None:
+                # MIME whitespace detects closed clients without presenting
+                # an invalid image part to a browser waiting for its first JPEG.
+                self.wfile.write(b'\r\n')
+            else:
+                previous, data = frame
+                next_frame_at = time.monotonic() + 1.0 / PREVIEW_STREAM_FPS
+                self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                                 + str(len(data)).encode() + b'\r\n\r\n' + data + b'\r\n')
+            self.wfile.flush()
 
     def stream_all(self):
-        """Multiplex four JPEG feeds over one browser connection.
+        """
+        Multiplex four JPEG feeds over one browser connection.
 
         Each packet is camera index (uint8), JPEG length (uint32, network byte
         order), followed by the JPEG bytes.  A single connection avoids browser
@@ -231,59 +222,49 @@ class PreviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         hub = self.server.hub
         names = tuple(CAMERAS)
-        previous = {name: 0 for name in names}
-        for name in names:
-            hub.watch(name, 1)
-        try:
-            while not hub.closed:
-                started = time.monotonic()
-                wrote = False
-                for index, name in enumerate(names):
-                    frame = hub.latest(name)
-                    if frame is None or frame[0] == previous[name]:
-                        continue
-                    sequence, data = frame[:2]
-                    previous[name] = sequence
-                    self.wfile.write(struct.pack('!BI', index, len(data)) + data)
-                    wrote = True
-                if wrote:
-                    self.wfile.flush()
-                delay = 1.0 / PREVIEW_STREAM_FPS - (time.monotonic() - started)
-                if delay > 0:
-                    time.sleep(delay)
-        finally:
-            for name in names:
-                hub.watch(name, -1)
+        previous = dict.fromkeys(names, 0)
+        while not hub.closed:
+            started = time.monotonic()
+            wrote = False
+            for index, name in enumerate(names):
+                frame = hub.latest(name)
+                if frame is None or frame[0] == previous[name]:
+                    continue
+                sequence, data = frame[:2]
+                previous[name] = sequence
+                self.wfile.write(struct.pack('!BI', index, len(data)) + data)
+                wrote = True
+            if wrote:
+                self.wfile.flush()
+            delay = 1.0 / PREVIEW_STREAM_FPS - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
 
     def snapshot(self, name):
         """Return one new stamped JPEG for model inference, never a cached old frame."""
         hub = self.server.hub
         existing = hub.latest(name)
         previous = existing[0] if existing is not None else 0
-        hub.watch(name, 1)
-        try:
-            frame = hub.wait_full(name, previous, timeout=1.0)
-            if frame is None:
-                self.send_error(504, 'No fresh camera frame')
-                return
-            sequence, data, _, stamp_ns = frame
-            if stamp_ns is None:
-                self.send_error(503, 'Camera frame has no source timestamp')
-                return
-            self.respond('image/jpeg', data, {
-                'X-XYC-Camera': name,
-                'X-XYC-Sequence': sequence,
-                'X-XYC-Source-Time-Ns': stamp_ns,
-            })
-        finally:
-            hub.watch(name, -1)
+        frame = hub.wait_full(name, previous, timeout=1.0)
+        if frame is None:
+            self.send_error(504, 'No fresh camera frame')
+            return
+        sequence, data, _, stamp_ns = frame
+        if stamp_ns is None:
+            self.send_error(503, 'Camera frame has no source timestamp')
+            return
+        self.respond('image/jpeg', data, {
+            'X-XYC-Camera': name,
+            'X-XYC-Sequence': sequence,
+            'X-XYC-Source-Time-Ns': stamp_ns,
+        })
 
 
 class CameraPreview(Node):
     def __init__(self, **kwargs):
         super().__init__('camera_preview', **kwargs)
         fixed = ParameterDescriptor(read_only=True)
-        port = self.declare_parameter('port', 17883, fixed).value
+        port = self.declare_parameter('port', robot_profile().ports['data'], fixed).value
         self.hub = FrameHub()
         # The preview is a four-camera service, so its ROS inputs are fixed for
         # the lifetime of the node.  Creating and destroying subscriptions from

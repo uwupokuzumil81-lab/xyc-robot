@@ -4,7 +4,7 @@ import time
 
 import torch
 
-from xyc.learning.contracts import OBS_STATE
+from xyc.contracts import OBS_STATE
 from .strategies import Prediction, RTCStrategy, SyncChunkStrategy
 
 
@@ -40,6 +40,11 @@ class PolicyRunner:
         if self.recorder is not None:
             self.recorder.event('runner_reset', strategy=self.strategy.name)
 
+    @staticmethod
+    def _state(batch):
+        # A model may request state history; traces retain the current measured state.
+        return batch.get('observation.current_state', batch[OBS_STATE])[0]
+
     def _predict(self, batch, *, observation=None, method='predict_chunk', **kwargs):
         predictor = getattr(self.adapter, method, None)
         if predictor is None:
@@ -59,8 +64,17 @@ class PolicyRunner:
         self.last_prediction_id = None
         if self.recorder is not None:
             self.last_prediction_id = self.recorder.prediction(
-                chunk[0], state=batch[OBS_STATE][0], observation=observation, latency_s=latency)
+                chunk[0], state=self._state(batch), observation=observation, latency_s=latency)
         return Prediction(chunk, self.last_prediction_id, latency)
+
+    @torch.no_grad()
+    def warmup(self, batch, *, observation=None):
+        """Initialize model kernels while the robot holds still; discard the chunk."""
+        self.adapter.eval()
+        reference = {**(observation or {}), 'phase': 'warmup_no_execution'}
+        prediction = self._predict(batch, observation=reference)
+        self.reset()
+        return prediction.latency_s
 
     @torch.no_grad()
     def step(self, batch, *, observation=None, video_frames=None):
@@ -77,11 +91,15 @@ class PolicyRunner:
         if self.recorder is not None:
             images = video_frames
             if self.recorder.record_video and images is None:
-                images = {
-                    name: batch['observation.images.' + name][0].detach().cpu().permute(1, 2, 0).numpy()
-                    for name in self.adapter.schema.cameras}
+                images = {}
+                for name in self.adapter.schema.cameras:
+                    key = 'observation.current_images.' + name
+                    frame = batch[key][0] if key in batch else batch['observation.images.' + name][0]
+                    if frame.ndim != 3:
+                        raise ValueError('Historical image batches must include observation.current_images')
+                    images[name] = frame.detach().cpu().permute(1, 2, 0).numpy()
             self.last_step_id = self.recorder.selection(
-                action[0], state=batch[OBS_STATE][0], prediction_id=selected.prediction_id,
+                action[0], state=self._state(batch), prediction_id=selected.prediction_id,
                 chunk_index=selected.chunk_index, observation=observation,
                 selection=selected.selection, contributors=list(selected.contributors), images=images)
         return action

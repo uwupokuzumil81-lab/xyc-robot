@@ -1,4 +1,5 @@
 from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'xyc_camera'
@@ -12,7 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
-        ('share/' + package_name + '/config', glob('config/*.yaml') + glob('config/*.xml')),
+        ('share/' + package_name + '/config', glob('config/*.xml')),
         ('share/' + package_name + '/web', glob('web/*.html')),
     ],
     install_requires=['setuptools'],

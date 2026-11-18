@@ -17,10 +17,11 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import String
 from xyc_interfaces.msg import ArmState, LeaderState
 from xyc_interfaces.srv import SetArmTargets
+from xyc_hardware.chassis_control import TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC
 
-from xyc_hardware.arm_calibration import arm_names
-from xyc_hardware.teleop_control import FollowTargets, follower_snapshot, leader_snapshot, stamp_ns
-from xyc_hardware.teleop_transport import (
+from xyc.robot.calibration import arm_names
+from xyc.teleop.mapping import FollowTargets, follower_snapshot, leader_snapshot, stamp_ns
+from xyc.transport.teleop import (
     INPUT_LOSS_DEADLINE, MAX_SAMPLE_AGE, PERIOD, PORT, REPLY_DEADLINE, SIDES,
     TELEOP_TARGET_DROPPED,
     cadence, checked_positions, read_frame, send_frame,
@@ -110,18 +111,22 @@ class LeaderStateBridge(Node):
         for sequence, _ in enumerate(cadence(period=self.period), 1):
             if not rclpy.ok():
                 return
-            started = time.monotonic()
             request = {'sequence': sequence, 'chassis_supported': self.pc_chassis is not None}
             if self.pc_chassis is not None:
                 request.update(self.pc_chassis.snapshot())
             if self.pc_recording is not None:
                 request.update(self.pc_recording.snapshot())
+            # Snapshot locks can wait for ROS callbacks. Measure the reply
+            # deadline from the actual send, not from local status preparation.
+            started = time.monotonic()
             send_frame(channel, request)
             frame = read_frame(channel)
             received = time.monotonic()
             round_trip = received - started
-            if frame['sequence'] != sequence or round_trip > REPLY_DEADLINE:
-                raise ValueError('主臂应答序号错误或到达过晚')
+            if frame['sequence'] != sequence:
+                raise ValueError(f'主臂应答序号错误：期望 {sequence}，收到 {frame["sequence"]}')
+            if round_trip > REPLY_DEADLINE:
+                raise ValueError(f'主臂网络应答耗时 {round_trip:.3f}s，超过 {REPLY_DEADLINE:.3f}s')
             if self.pc_recording is not None:
                 self.pc_recording.receive(session, frame.get('recording'))
             if 'chassis' in frame:
@@ -167,6 +172,7 @@ class TeleopController(Node):
         fixed = ParameterDescriptor(read_only=True)
         side = self.declare_parameter('side', 'right', fixed).value
         self.live = self.declare_parameter('live', False, fixed).value
+        self.fault_publisher = self.create_publisher(String, TELEOP_FAULT_TOPIC, TELEOP_FAULT_QOS)
         start_when_ready = self.declare_parameter('start_when_ready', False, fixed).value
         recording = self.declare_parameter('recording', False, fixed).value
         self.recording_active_at = None
@@ -238,10 +244,12 @@ class TeleopController(Node):
             return
         try:
             self.update_targets()
-        except (ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             self.stopped = True
             self.timer.cancel()
-            self.get_logger().error(f'遥操已停止：{exc}。请检查后重新启动控制节点。')
+            reason = f'遥操已停止：{exc}'
+            self.fault_publisher.publish(String(data=reason))
+            self.get_logger().error(reason + '。请检查后重启遥操后端。')
 
     def start_managed_arms(self, now, sample_id):
         if self.start_pending is None:
@@ -463,7 +471,7 @@ def controller_components():
         from rclpy.parameter import Parameter
         from xyc_hardware.arm_group_coordinator import ArmGroupCoordinator
         coordinator = ArmGroupCoordinator(use_global_arguments=False, parameter_overrides=[
-            Parameter('command_source', value='teleop'), Parameter('streaming_targets', value=True)])
+            Parameter('command_source', value='teleop')])
         nodes.append(coordinator)
         controller.destroy_client(controller.client)
         controller.client = LocalArmClient(coordinator, coordinator.set_targets, SetArmTargets.Response)

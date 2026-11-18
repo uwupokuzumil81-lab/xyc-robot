@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from xyc_hardware.base_kinematics import OmniGeometry
 from xyc_hardware.chassis_control import (
-    AXIS_IDS, HOMING_SPEED_M_S, ChassisControl, ChassisDriver, ChassisNotReady, ChassisRos,
+    AXIS_IDS, HOMING_SPEED_M_S, ChassisControl, ChassisDriver, ChassisNotReady, ChassisRos, mobile_message,
 )
 from xyc_hardware.chassis_bridge import PCChassisBridge
 from xyc_hardware.lift_tracking import LiftGeometry, LiftTracker
@@ -35,7 +35,7 @@ class FakeChassisDriver:
     def axis_read(self, motor_id, address, size):
         return b'\x01'
 
-    def write_velocities(self, values):
+    def write_velocities(self, values, *, deadline=None):
         self.writes.append(dict(values))
         if self.fail_write:
             raise ConnectionError('injected velocity readback failure')
@@ -62,6 +62,36 @@ def make_control():
 
 
 class TestChassisControl(unittest.TestCase):
+    def test_current_protection_uses_the_same_elapsed_time_at_ten_hz(self):
+        for motor_id, current, duration in ((8, 5., .1), (11, 8.5, .1),
+                                            (8, 2.9, .7), (11, 4.5, .7)):
+            with self.subTest(motor_id=motor_id, current=current):
+                control, driver, now, samples = make_control()
+                control.enable()
+                samples[motor_id]['current_a'] = current
+                control.observe(samples)
+                for frame in range(1, round(duration * 10) + 1):
+                    now[0] = 1. + frame / 10
+                    control.observe(samples)
+                    if frame < round(duration * 10):
+                        self.assertTrue(control.enabled)
+                self.assertIn('持续过流', control.fault)
+                self.assertFalse(control.enabled)
+                self.assertEqual(driver.velocity_owned, set())
+
+    def test_short_missing_sample_cannot_reset_an_existing_overcurrent_window(self):
+        control, _, now, samples = make_control()
+        control.enable()
+        samples[8]['current_a'] = 5.
+        control.observe(samples)
+        now[0] = 1.03
+        control.observe({i: sample for i, sample in samples.items() if i != 9})
+        self.assertTrue(control.enabled)
+        now[0] = 1.1
+        control.observe(samples)
+        self.assertFalse(control.enabled)
+        self.assertIn('持续过流', control.fault)
+
     def test_stationary_encoder_window_accepts_noisy_speed_but_rejects_real_motion(self):
         control, driver, now, samples = make_control()
         samples[11].update(velocity_raw=-50, moving=True)
@@ -89,49 +119,51 @@ class TestChassisControl(unittest.TestCase):
         self.assertEqual(driver.velocity_owned, set())
         self.assertIn('使能未完成', control.fault)
 
-    def test_recording_pairs_new_base_and_lift_requests_by_their_send_timestamp(self):
-        from geometry_msgs.msg import TwistStamped
-        control, _, _, _ = make_control()
+    def test_mobile_acknowledgment_follows_application_of_all_four_axes(self):
+        control, driver, now, samples = make_control()
         control.enable()
         control.height = .1
         control.tracker = LiftTracker(control.lift_geometry, reference_id='test-reference',
                                       zero_tick=2000, reference_time_s=1.)
         ros = object.__new__(ChassisRos)
-        ros.control, ros.valid_command = control, MagicMock()
+        ros.teleop_fault = ''
+        ros.control, ros.pending_command, ros.latest_command_ns = control, None, 0
         ros.recording_command_publisher = MagicMock()
-        ros.recording_requests, ros.last_recording_command_ns = {}, 0
-        ros.node = SimpleNamespace(group_session_id='left-test',
-            get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=200_000_000)))
-        base, lift = TwistStamped(), TwistStamped()
-        base.header.stamp.nanosec = lift.header.stamp.nanosec = 100_000_000
-        base.twist.linear.x = .15
-        lift.twist.linear.z = .015
-        ros.base_command(base)
+        ros.node = SimpleNamespace(group_session_id='left-test', get_logger=MagicMock(),
+            get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+                nanoseconds=round(now[0] * 1e9), to_msg=lambda: SimpleNamespace(
+                    sec=int(now[0]), nanosec=round(now[0] % 1 * 1e9)))))
+        message = mobile_message(ros.node, [1., 1., 0., 0.])
+        ros.mobile_command(message)
         ros.recording_command_publisher.publish.assert_not_called()
-        ros.lift_command(lift)
+        now[0] = 1.01
+        control.observe(samples)
+        ros.record_mobile_command()
         event = json.loads(ros.recording_command_publisher.publish.call_args.args[0].data)
-        self.assertEqual(event['targets'], [.015, .15, 0., 0.])
-        self.assertEqual(event['generated_ns'], 100_000_000)
-        self.assertEqual(event['accepted_ns'], 200_000_000)
-        ros.lift_command(lift)
+        self.assertEqual(event['targets'], [1, 1, 0, 0])
+        self.assertEqual(event['generated_ns'], 1_000_000_000)
+        self.assertEqual(event['accepted_ns'], 1_010_000_000)
+        self.assertTrue(any(driver.writes[-1].values()))
+        ros.record_mobile_command()
         self.assertEqual(ros.recording_command_publisher.publish.call_count, 1)
-        ros.valid_command.side_effect = ValueError('invalid')
-        lift.header.stamp.nanosec = 120_000_000
-        ros.lift_command(lift)
+        message.commands = [2, 0, 0, 0]
+        ros.mobile_command(message)
+        ros.record_mobile_command()
         self.assertEqual(ros.recording_command_publisher.publish.call_count, 1)
+
     def test_startup_and_read_only_feedback_write_nothing(self):
         control, driver, _, _ = make_control()
         self.assertFalse(control.enabled)
         self.assertEqual(driver.writes, [])
 
     def test_base_forward_sideways_and_yaw_follow_reference_geometry(self):
-        for velocity, signs in (((.1, 0., 0.), (1, 0, -1)),
-                                ((0., .1, 0.), (-1, 1, -1)),
-                                ((0., 0., .4), (1, 1, 1))):
-            with self.subTest(velocity=velocity):
+        for commands, signs, velocity in (((1, 0, 0), (1, 0, -1), (.15, 0., 0.)),
+                                          ((0, 1, 0), (-1, 1, -1), (0., .15, 0.)),
+                                          ((0, 0, 1), (1, 1, 1), (0., 0., .6))):
+            with self.subTest(commands=commands):
                 control, driver, now, samples = make_control()
                 control.enable()
-                control.set_base(*velocity)
+                control.set_mobile([0, *commands], deadline=control.clock() + .3)
                 now[0] += .03
                 control.observe(samples)
                 speeds = driver.writes[-1]
@@ -145,7 +177,7 @@ class TestChassisControl(unittest.TestCase):
     def test_missing_command_times_out_to_zero_with_valid_feedback(self):
         control, driver, now, samples = make_control()
         control.enable()
-        control.set_base(.1, 0., 0.)
+        control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3)
         now[0] += .03
         control.observe(samples)
         now[0] += .30
@@ -156,11 +188,11 @@ class TestChassisControl(unittest.TestCase):
     def test_stop_and_failed_write_zero_and_release_owned_axes(self):
         control, driver, now, samples = make_control()
         control.enable()
-        control.set_base(.1, 0., 0.)
+        control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3)
         control.observe(samples)
         control.stop()
         self.assertEqual(driver.writes[-1], dict.fromkeys(AXIS_IDS, 0))
-        control.set_base(.1, 0., 0.)
+        control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3)
         driver.fail_write = True
         control.observe(samples)
         self.assertFalse(control.enabled)
@@ -177,7 +209,7 @@ class TestChassisControl(unittest.TestCase):
         self.assertTrue(control.fault)
         self.assertTrue(all(set(write) <= set(AXIS_IDS) for write in driver.writes))
         with self.assertRaises(ValueError):
-            control.set_base(.1, 0., 0.)
+            control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3)
 
     def test_one_missing_poll_pauses_velocity_but_recovers_without_losing_height_reference(self):
         control, driver, now, samples = make_control()
@@ -188,8 +220,7 @@ class TestChassisControl(unittest.TestCase):
         now[0] += .03
         control.observe(samples)
         tracker = control.tracker
-        control.set_base(.1, 0., 0.)
-        control.set_lift(.005)
+        control.set_mobile([1, 1, 0, 0], deadline=control.clock() + .3)
         now[0] += .03
         control.observe(samples)
         self.assertTrue(any(control.sent.values()))
@@ -201,8 +232,8 @@ class TestChassisControl(unittest.TestCase):
         self.assertFalse(control.fault)
         self.assertEqual(control.sent, dict.fromkeys(AXIS_IDS, 0))
         self.assertEqual(control.missing_feedback_ids, (9,))
-        for operation in (lambda: control.set_base(.1, 0., 0.),
-                          lambda: control.set_lift(.005), control.begin_home):
+        for operation in (lambda: control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3),
+                          lambda: control.set_mobile([1, 0, 0, 0], deadline=control.clock() + .3), control.begin_home):
             with self.assertRaises(ValueError):
                 operation()
         now[0] += .03
@@ -212,7 +243,7 @@ class TestChassisControl(unittest.TestCase):
         self.assertIs(control.tracker, tracker)
         self.assertGreater(control.height, 0.)
         self.assertEqual(control.sent, dict.fromkeys(AXIS_IDS, 0))
-        control.set_base(.1, 0., 0.)
+        control.set_mobile([0, 1, 0, 0], deadline=control.clock() + .3)
         now[0] += .02
         control.observe(samples)
         self.assertTrue(any(control.sent.values()))
@@ -247,7 +278,9 @@ class TestChassisControl(unittest.TestCase):
         control, driver, _, _ = make_control()
         control.enable()
         ros = object.__new__(ChassisRos)
+        ros.teleop_fault = ''
         ros.control, ros.last_status = control, time.monotonic()
+        ros.pending_command = None
         ros.node = SimpleNamespace(get_logger=lambda: MagicMock())
         ros.state_publisher = MagicMock()
         ros.observe(SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace()), motors=[SimpleNamespace(
@@ -260,13 +293,13 @@ class TestChassisControl(unittest.TestCase):
     def test_limits_and_nonfinite_values_are_rejected(self):
         control, _, _, _ = make_control()
         control.enable()
-        for velocity in ((.3, 0., 0.), (0., 0., .9), (math.nan, 0., 0.)):
+        for velocity in ((0., 2., 0., 0.), (0., 0., 0., 1.5), (math.nan, 0., 0., 0.)):
             with self.subTest(velocity=velocity), self.assertRaises(ValueError):
-                control.set_base(*velocity)
+                control.set_mobile(velocity, deadline=control.clock() + .3)
         with self.assertRaises(ValueError):
-            control.set_lift(.02)
+            control.set_mobile([2, 0, 0, 0], deadline=control.clock() + .3)
         with self.assertRaisesRegex(ValueError, '零点'):
-            control.set_lift(.01)
+            control.set_mobile([1, 0, 0, 0], deadline=control.clock() + .3)
 
     def test_lift_uses_speed_mode_and_opposite_encoder_direction(self):
         control, driver, now, samples = make_control()
@@ -277,11 +310,11 @@ class TestChassisControl(unittest.TestCase):
         samples[11]['position_ticks'] = 1687
         control.observe(samples)
         self.assertGreater(control.height, .009)
-        control.set_lift(.01)
+        control.set_mobile([1, 0, 0, 0], deadline=control.clock() + .3)
         now[0] += .03
         control.observe(samples)
         self.assertLess(driver.writes[-1][11], 0)
-        control.set_lift(-.01)
+        control.set_mobile([-1, 0, 0, 0], deadline=control.clock() + .3)
         now[0] += .03
         control.observe(samples)
         self.assertGreater(driver.writes[-1][11], 0)
@@ -291,7 +324,7 @@ class TestChassisControl(unittest.TestCase):
         control.enable()
         control.tracker = LiftTracker(control.lift_geometry, reference_id='verified',
                                       zero_tick=2000, reference_time_s=now[0])
-        control.set_lift(-.01)
+        control.set_mobile([-1, 0, 0, 0], deadline=control.clock() + .3)
         now[0] += .03
         control.observe(samples)
         self.assertEqual(control.sent[11], 0)
@@ -304,7 +337,7 @@ class TestChassisControl(unittest.TestCase):
         for _ in range(30):
             if not control.enabled:
                 break
-            control.set_lift(.01)
+            control.set_mobile([1, 0, 0, 0], deadline=control.clock() + .3)
             now[0] += .03
             control.observe(samples)
         self.assertFalse(control.enabled)
@@ -459,22 +492,22 @@ class TestChassisControl(unittest.TestCase):
         self.assertIn('控制端断开', control.fault)
 
     def test_direction_commands_during_homing_renew_connection_without_overriding_motion(self):
-        from geometry_msgs.msg import TwistStamped
-        for speed in (-.015, 0., .015):
-            with self.subTest(speed=speed):
+        from xyc_interfaces.msg import MobileCommand
+        for direction in (-1, 0, 1):
+            with self.subTest(direction=direction):
                 control, driver, now, samples = make_control()
                 control.enable()
                 control.begin_home()
                 ros = object.__new__(ChassisRos)
-                ros.control, ros.valid_command = control, MagicMock()
+                ros.teleop_fault = ''
+                ros.latest_command_ns = 0
+                ros.control, ros.valid_command = control, MagicMock(side_effect=lambda msg: now[0] + .25)
                 for _ in range(6):
                     now[0] += .1
-                    message = TwistStamped()
-                    message.twist.linear.z = speed
-                    ros.lift_command(message)
+                    message = MobileCommand()
+                    message.commands = [direction, 0, 0, 0]
+                    ros.mobile_command(message)
                     control.observe(samples)
-                    # Keep the simulated lift moving, rather than inventing
-                    # stationary contact at its mechanical stop.
                     samples[11]['position_ticks'] += 50
                     samples[11]['velocity_raw'] = 500
                 self.assertTrue(control.enabled)
@@ -486,16 +519,16 @@ class TestChassisControl(unittest.TestCase):
                 self.assertFalse(control.enabled)
                 self.assertIn('控制端断开', control.fault)
 
-
-    def test_disabled_zero_heartbeats_preserve_the_initial_failure_reason(self):
-        from geometry_msgs.msg import TwistStamped
+    def test_disabled_zero_heartbeats_preserve_the_original_fault_reason(self):
+        from xyc_interfaces.msg import MobileCommand
         control, _, _, _ = make_control()
-        control.reason = '操作被拒绝：ID 8 寄存器核对失败'
+        control.reason = 'ID 8 寄存器核对失败'
         ros = object.__new__(ChassisRos)
-        ros.control, ros.valid_command = control, MagicMock()
-        for callback in (ros.base_command, ros.lift_command):
-            callback(TwistStamped())
-            self.assertIn('ID 8 寄存器核对失败', control.reason)
+        ros.teleop_fault = ''
+        ros.latest_command_ns = 0
+        ros.control, ros.valid_command = control, MagicMock(return_value=control.clock() + .25)
+        ros.mobile_command(MobileCommand())
+        self.assertIn('ID 8 寄存器核对失败', control.reason)
 
 
 class TestChassisPackets(unittest.TestCase):
@@ -523,7 +556,7 @@ class TestChassisPackets(unittest.TestCase):
                     self.assertEqual(memory[8, 40], b'\x00')
 
     def test_axis_read_retries_only_reads_and_rejects_invalid_torque_bytes(self):
-        from xyc_hardware.feetech_reader import Reply
+        from xyc.robot.feetech import Reply
         driver = object.__new__(ChassisDriver)
         driver._send_joint_packet = MagicMock()
         driver._receive = MagicMock(side_effect=[{}, {8: Reply(b'\x32', 0, 1)},
@@ -543,7 +576,7 @@ class TestChassisPackets(unittest.TestCase):
             operations.append((i, a, value))
             memory[i, a] = value
         driver.axis_write = write
-        driver.write_velocities = lambda values: operations.append(dict(values))
+        driver.write_velocities = lambda values, **kwargs: operations.append(dict(values))
         driver.enable_velocity_axes()
         zero_index = operations.index(dict.fromkeys(AXIS_IDS, 0))
         enabled = [index for index, op in enumerate(operations)
@@ -565,7 +598,7 @@ class TestChassisPackets(unittest.TestCase):
             body = bytes([motor_id, 4, 0]) + data
             replies.append(b'\xff\xff' + body + bytes([~sum(body) & 255]))
         serial = FakeSerial([b''.join(replies)])
-        with patch('xyc_hardware.feetech_reader.serial.Serial', return_value=serial):
+        with patch('xyc.robot.feetech.serial.Serial', return_value=serial):
             driver = ChassisDriver('/unused', list(range(1, 12)), bus='left', joint_id=6)
         driver.write_velocities(targets)
         self.assertEqual(serial.writes[0][4:7], b'\x83\x2e\x02')
@@ -586,16 +619,19 @@ class TestPCChassisROS(unittest.TestCase):
         import rclpy
         import yaml
         from rclpy.executors import SingleThreadedExecutor
-        from xyc_hardware.feetech_reader import Reply
+        from xyc.robot.feetech import Reply
         from xyc_hardware.motor_state_node import MotorStateNode
         self.rclpy = rclpy
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        config = Path(__file__).parents[1] / 'config/motors.yaml'
-        parameters = yaml.safe_load(config.read_text())['/motors/left/motor_state']['ros__parameters']
+        from xyc.robot.profile import robot_profile
+        parameters = robot_profile().motor_parameters('left')
         parameters.update(port='/fake/chassis', chassis_mode=True)
         path = Path(self.directory.name) / 'parameters.yaml'
-        path.write_text(yaml.safe_dump({'/**': {'ros__parameters': parameters}}))
+        path.write_text(yaml.safe_dump({
+            '/**': {'ros__parameters': parameters},
+            '/teleop_controller': {'ros__parameters': {'live': True}},
+        }))
         rclpy.init(args=['--ros-args', '--params-file', str(path)])
         self.addCleanup(rclpy.try_shutdown)
         class Reader(FakeChassisDriver):
@@ -617,7 +653,7 @@ class TestPCChassisROS(unittest.TestCase):
                     output[i] = Reply(bytes(raw), 0, time.time_ns())
                 return output
         self.reader = Reader()
-        with patch('xyc_hardware.chassis_control.ChassisDriver', return_value=self.reader):
+        with patch('xyc_hardware.motor_state_node.ChassisDriver', return_value=self.reader):
             self.motor = MotorStateNode()
         self.keyboard = PCChassisBridge()
         self.operator = None
@@ -670,7 +706,7 @@ class TestPCChassisROS(unittest.TestCase):
     def test_automatic_enable_waits_for_service_discovery_then_reaches_hardware(self):
         bridge = self.create_pc_bridge()
         bridge.timer.cancel()
-        payload = {'base': [0., 0., 0.], 'lift_m_s': 0.,
+        payload = {'commands': [0., 0., 0., 0.],
                    'operation': {'id': 1, 'name': 'enable'}}
         bridge.receive_packet('test', payload)
         client = bridge.control_clients['enable']
@@ -690,7 +726,7 @@ class TestPCChassisROS(unittest.TestCase):
     def test_automatic_enable_retries_only_known_prewrite_startup_rejections(self):
         bridge = self.create_pc_bridge()
         bridge.timer.cancel()
-        payload = {'base': [0., 0., 0.], 'lift_m_s': 0.,
+        payload = {'commands': [0., 0., 0., 0.],
                    'operation': {'id': 1, 'name': 'enable'}}
         self.spin_until(bridge.control_clients['enable'].service_is_ready)
         original = self.motor.chassis.control.enable
@@ -715,7 +751,7 @@ class TestPCChassisROS(unittest.TestCase):
         bridge.timer.cancel()
         self.spin_until(bridge.control_clients['enable'].service_is_ready)
         self.motor.chassis.control.enable = MagicMock(side_effect=ConnectionError('ID 8 寄存器核对失败'))
-        payload = {'base': [0., 0., 0.], 'lift_m_s': 0.,
+        payload = {'commands': [0., 0., 0., 0.],
                    'operation': {'id': 1, 'name': 'enable'}}
         def rejected():
             bridge.receive_packet('test', payload)
@@ -744,28 +780,112 @@ class TestPCChassisROS(unittest.TestCase):
         self.motor.chassis.close()
         self.assertEqual(self.reader.velocity_owned, set())
 
-    def test_stale_topic_command_and_feedback_loss_stop_the_chassis(self):
-        from geometry_msgs.msg import TwistStamped
+    def test_arm_fault_stops_base_and_lift_and_blocks_packets_after_reconnect(self):
+        from concurrent.futures import Future
+        from std_srvs.srv import Trigger
+        from xyc_interfaces.srv import SetArmTargets
+        from xyc_hardware.teleop_nodes import TeleopController
+
+        controller = TeleopController()
+        self.addCleanup(controller.destroy_node)
+        self.assertTrue(controller.live)
+        self.spin_until(lambda: controller.fault_publisher.get_subscription_count() == 2)
+        self.connect_operator()
+        chassis = self.motor.chassis
+        self.operator.handle_key('h')
+        self.reader.contact = True
+        self.spin_until(lambda: chassis.control.homing == 'settling')
+        self.reader.contact = False
+        self.spin_until(lambda: self.operator.state.get('height_m') == 0.
+                        and not self.operator.state.get('homing'))
+        self.operator.handle_key('w')
+        self.operator.handle_key('i')
+        self.spin_until(lambda: chassis.control.sent[8] != 0 and chassis.control.sent[11] != 0)
+        queued = mobile_message(self.keyboard, [1, 1, 0, 0])
+
+        controller.pending = Future()
+        controller.pending.set_result(SetArmTargets.Response(accepted=False, message='right arm write failed'))
+        controller.tick()
+        self.assertTrue(controller.stopped)
+        self.spin_until(lambda: bool(self.keyboard.teleop_fault and chassis.teleop_fault))
+        self.assertEqual(self.reader.writes[-1], dict.fromkeys(AXIS_IDS, 0))
+        after_stop = len(self.reader.writes)
+        self.assertIn('right arm write failed', self.keyboard.snapshot()['chassis_status']['fault'])
+
+        self.operator = None
+        for session in ('operator', 'reconnected'):
+            self.keyboard.begin_session(session)
+            self.keyboard.receive_packet(session, {'commands': [1, 1, 0, 0],
+                                                    'operation': {'id': 1, 'name': 'home_lift'}})
+            self.assertFalse(self.keyboard.snapshot()['chassis_ack']['accepted'])
+            self.assertIsNone(self.keyboard.packet)
+        self.keyboard.mobile_pub.publish(queued)
+        self.keyboard.mobile_pub.publish(mobile_message(self.keyboard, [1, 1, 0, 0]))
+        for service in ('enable', 'home_lift'):
+            future = self.keyboard.control_clients[service].call_async(Trigger.Request())
+            self.spin_until(future.done)
+            self.assertFalse(future.result().success)
+            self.assertIn('right arm write failed', future.result().message)
+        self.assertEqual(len(self.reader.writes), after_stop)
+        self.assertFalse(chassis.control.homing)
+
+    def test_stale_topic_command_is_ignored_and_feedback_loss_stops_the_chassis(self):
+        from xyc_interfaces.msg import MobileCommand
         self.connect_operator()
         c = self.motor.chassis.control
-        c.set_base(.1, 0., 0.)
-        expired = TwistStamped()
+        c.set_mobile([0, 1, 0, 0], deadline=c.clock() + .3)
+        expired = MobileCommand()
         expired.header.frame_id = 'base_link'
         expired.header.stamp.sec = 1
-        expired.twist.linear.x = .2
-        self.motor.chassis.base_command(expired)
-        self.assertEqual(c.base, (0., 0., 0.))
+        expired.expires_at.sec, expired.expires_at.nanosec = 1, 50_000_000
+        expired.commands = [0, 1, 0, 0]
+        self.motor.chassis.mobile_command(expired)
+        self.assertEqual(c.base, (.15, 0., 0.))
         c.last_feedback = time.monotonic() - .3
         self.motor.chassis.check_feedback()
         self.assertFalse(c.enabled)
         self.assertEqual(self.reader.velocity_owned, set())
+
+    def test_stop_service_rejects_an_unexpired_command_published_before_stop(self):
+        from std_srvs.srv import Trigger
+        from xyc_interfaces.msg import MobileCommand
+        from xyc_hardware.chassis_control import COMMAND_QOS
+        self.connect_operator()
+        self.keyboard.timer.cancel()
+        publisher = self.keyboard.create_publisher(MobileCommand, '/robot/mobile/command', COMMAND_QOS)
+        self.spin_until(lambda: publisher.get_subscription_count() > 0)
+        queued = mobile_message(self.keyboard, [0, 1, 0, 0])
+        future = self.keyboard.control_clients['stop'].call_async(Trigger.Request())
+        self.spin_until(future.done)
+        self.assertTrue(future.result().success)
+        self.assertLess(self.keyboard.get_clock().now().nanoseconds,
+                        queued.expires_at.sec * 10**9 + queued.expires_at.nanosec)
+        publisher.publish(queued)
+        until = time.monotonic() + .08
+        self.spin_until(lambda: time.monotonic() >= until)
+        self.assertTrue(all(not any(row.values()) for row in self.reader.writes))
+
+    def test_short_lifetime_message_delayed_in_ros_queue_cannot_move_wheels(self):
+        from xyc_interfaces.msg import MobileCommand
+        from xyc_hardware.chassis_control import COMMAND_QOS
+        self.connect_operator()
+        self.keyboard.timer.cancel()
+        publisher = self.keyboard.create_publisher(MobileCommand, '/robot/mobile/command', COMMAND_QOS)
+        self.spin_until(lambda: publisher.get_subscription_count() > 0)
+        now = self.keyboard.get_clock().now().nanoseconds
+        command = mobile_message(self.keyboard, [0, 1, 0, 0], expires_ns=now + 50_000_000)
+        publisher.publish(command)
+        time.sleep(.08)  # Leave it in the real DDS queue until after the caller's deadline.
+        self.spin_until(lambda: 'expired in the ROS queue' in self.motor.chassis.control.reason)
+        self.assertTrue(all(not any(row.values()) for row in self.reader.writes))
+        self.assertEqual(self.motor.chassis.control.base, (0., 0., 0.))
 
     def test_pc_tcp_session_relays_keyboard_and_stops_on_disconnect(self):
         import socket
         import threading
         from test_pc_teleop import pc
         from xyc_hardware.teleop_nodes import LeaderStateBridge
-        from xyc_hardware.teleop_transport import read_frame, send_frame
+        from xyc.transport.teleop import read_frame, send_frame
         self.keyboard.timer.cancel()
         bridge = LeaderStateBridge()
         self.executor.add_node(bridge)
@@ -845,15 +965,24 @@ class TestPCChassisROS(unittest.TestCase):
             pass
         frame = {'sequence': 1, 'sample_id': 1, 'sample_age_ns': 0,
                  'positions': {'left': [0.] * 7}, 'calibration_ids': {'left': '0' * 64},
-                 'chassis': {'base': [0., 0., 0.], 'lift_m_s': 0., 'operation': None}}
-        channel = MagicMock()
-        channel.readline.return_value = json.dumps(frame).encode() + b'\n'
-        bridge.publish_frame = MagicMock(side_effect=Complete)
+                 'chassis': {'commands': [0., 0., 0., 0.], 'operation': None}}
+        snapshot = bridge.pc_chassis.snapshot
         try:
-            with self.assertRaises(Complete):
-                bridge.publish_session(channel)
-            bridge.publish_frame.assert_called_once()
-            self.assertFalse(self.motor.chassis.control.enabled)
+            # Local status preparation can exceed the network reply deadline;
+            # an immediately returned fresh sample must still be published.
+            for status_delay in (0., .20):
+                with self.subTest(status_delay=status_delay):
+                    def collect_status():
+                        time.sleep(status_delay)
+                        return snapshot()
+                    channel = MagicMock()
+                    channel.readline.return_value = json.dumps(frame).encode() + b'\n'
+                    bridge.publish_frame = MagicMock(side_effect=Complete)
+                    with patch.object(bridge.pc_chassis, 'snapshot', side_effect=collect_status), \
+                            self.assertRaises(Complete):
+                        bridge.publish_session(channel)
+                    bridge.publish_frame.assert_called_once()
+                    self.assertFalse(self.motor.chassis.control.enabled)
         finally:
             bridge.pc_chassis.destroy_node()
             bridge.destroy_node()
@@ -861,3 +990,24 @@ class TestPCChassisROS(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCombinedTernaryCommands(unittest.TestCase):
+    def test_all_fixed_speed_combinations_fit_wheels_with_proportional_saturation(self):
+        from itertools import product
+        from xyc.contracts import physical_mobile_action
+        for axes in product((-1., 0., 1.), repeat=3):
+            control, driver, now, samples = make_control()
+            control.enabled = True
+            _, x, y, yaw = physical_mobile_action([0., *axes])
+            control.set_mobile([0., *axes], deadline=control.clock() + .3)
+            wheels = control.geometry.body_to_wheels(*control.base)
+            self.assertLessEqual(max(map(abs, wheels)), control.geometry.max_wheel_rad_s + 1e-9)
+            factors = [actual / requested for actual, requested in zip(control.base, (x,y,yaw)) if requested]
+            if factors:
+                self.assertLessEqual(max(factors), 1.)
+                self.assertLess(max(factors) - min(factors), 1e-9)
+        control, _, _, _ = make_control()
+        control.enabled = True
+        control.set_mobile([0, 1, 1, 0], deadline=control.clock() + .3)
+        self.assertEqual(control.base, (.15, .15, 0.))

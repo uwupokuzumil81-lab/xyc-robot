@@ -1,21 +1,28 @@
 name: xyc
 channels:
   - https://prefix.dev/robostack-jazzy
-  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+  - conda-forge
   - nodefaults
 dependencies:
   - python=3.12
+  # colcon 0.19 symlink builds use the pre-80 setuptools develop interface.
+  - setuptools>=68,<80
   - ros-jazzy-ros-base
   - ros-jazzy-demo-nodes-py
   - ros-jazzy-cv-bridge
-  - ros-jazzy-message-filters
   - ros-jazzy-rosbag2-storage-mcap
-  - ros-jazzy-diagnostic-msgs
   - ros-dev-tools
+  - colcon-notification
+  - cmake
+  - make
+  - ninja
+  - c-compiler
+  - cxx-compiler
   - ros-jazzy-rosidl-default-runtime
   - ros-jazzy-rosidl-default-generators
   - pyserial
   - pyyaml
-  - opencv
+  - opencv>=4.9,<6
+  - numpy>=1.26,<3
   - pytest
   - pip
