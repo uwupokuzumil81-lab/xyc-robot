@@ -17,6 +17,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Observation.msg"
   "srv/ArmBusTransaction.srv"
   "srv/SetArmTargets.srv"
+  "srv/ProtectiveStop.srv"
   "srv/RecordingControl.srv"
   DEPENDENCIES std_msgs builtin_interfaces sensor_msgs
 )

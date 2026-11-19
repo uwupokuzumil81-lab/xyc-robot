@@ -8,10 +8,10 @@ import time
 
 from xyc.io import content_id
 from xyc.contracts import SIDES
+from xyc.transport.teleop import MAX_SAMPLE_AGE
 from .leader import (ROOT, USB_SERIALS, LEADER_SAMPLE_PERIOD, LeaderCalibrationReader,
                      arm_names, identity, leader_stream_sample, load_calibration,
                      open_spec, require_torque_off)
-from .mapping import FollowTargets
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class LeaderFrame:
     calibration_ids: dict
     notice: str = ''
     error: str = ''
+    reused_positions: bool = False
 
 
 class LeaderArms:
@@ -33,7 +34,7 @@ class LeaderArms:
         self.lock = threading.Condition()
         self.active, self.stopping = threading.Event(), threading.Event()
         self.latest = None
-        self.planner = self.stack = self.worker = None
+        self.stack = self.worker = None
         self.generation = self.sequence = 0
 
     @property
@@ -75,7 +76,8 @@ class LeaderArms:
             started = time.monotonic()
             with self.lock:
                 generation = self.generation
-            positions, notices, error, stamp = {}, [], '', time.monotonic_ns()
+            positions, notices, error = {}, [], ''
+            batch_started_ns = stamp = time.monotonic_ns()
             jobs = {side: self.pool.submit(self._sample, side) for side in self.sides}
             for side, job in jobs.items():
                 try:
@@ -89,14 +91,15 @@ class LeaderArms:
                 if generation == self.generation and self.active.is_set() and not self.stopping.is_set():
                     self.sequence += 1
                     self.latest = LeaderFrame(self.sequence, stamp, positions,
-                                              dict(self.calibration_ids), '；'.join(notices), error)
+                                              dict(self.calibration_ids), '；'.join(notices), error,
+                                              reused_positions=stamp < batch_started_ns)
                     self.lock.notify_all()
             self.stopping.wait(max(0., LEADER_SAMPLE_PERIOD - (time.monotonic() - started)))
 
     def resume(self):
         with self.lock:
             self.generation += 1
-            self.latest = self.planner = None
+            self.latest = None
         self.active.set()
 
     def pause(self):
@@ -114,14 +117,12 @@ class LeaderArms:
                                self.latest is not None and self.latest.sample_id > sample_id, timeout)
             return self.latest
 
-    def targets(self, follower):
+    def fresh_snapshot(self):
         frame = self.snapshot()
         if (not self.active.is_set() or frame is None or frame.error
-                or time.monotonic_ns() - frame.stamp_ns > 200_000_000):
+                or not 0 <= time.monotonic_ns() - frame.stamp_ns <= MAX_SAMPLE_AGE * 1e9):
             return None
-        if self.planner is None:
-            self.planner = FollowTargets(frame.positions, follower, absolute=True)
-        return self.planner.update(frame.positions)
+        return frame
 
     def close(self):
         self.stopping.set()

@@ -117,7 +117,7 @@ class RecordingRemote:
             if self.operation is not None:
                 self.notice = '正在等待上一个采集操作回执'
                 return
-            operation = {'r': 'start', 'b': 'save', 'n': 'discard', 'q': 'save', '\x03': 'save'}.get(key.lower())
+            operation = {'r': 'start', 'b': 'save', 'n': 'discard'}.get(key.lower())
             if operation is None:
                 return
             recovering = (self.status.get('phase') == 'error'
@@ -220,31 +220,33 @@ class LocalChassisKeyboard:
         self.operation = {'id': 1, 'name': 'enable'}
         self.next_operation = 2
         self.control_error = ''
-        self.quit_at = None
-        self.quit_confirmed = False
+        self.quitting = False
         self.notice = '连接后自动准备；主臂直接跟随，升降先 H 回零'
 
     def handle_key(self, key, now=None):
         key = key.lower()
-        if key == 'h' and self.recording is not None and not self.recording.home_allowed():
-            with self.lock:
-                self.notice = '当前采集回合尚未结束；先 B 保存或 N 丢弃，再按 H 回零'
-            return
-        if self.recording is not None and key in ('r', 'b', 'n', 'q', '\x03'):
-            self.recording.key(key)
         now = time.monotonic() if now is None else now
         with self.lock:
-            if key in ('h', ' ', 'q', '\x03'):
+            if self.quitting:
+                return
+            if key in ('q', '\x03'):
                 self.mobile.reset()
-                name = {'h': 'home_lift', ' ': 'stop',
-                        'q': 'stop', '\x03': 'stop'}[key]
+                self.operation = None
+                self.quitting = True
+                return
+            if key == 'h' and self.recording is not None and not self.recording.home_allowed():
+                self.notice = '当前采集回合尚未结束；先 B 保存或 N 丢弃，再按 H 回零'
+                return
+            if self.recording is not None and key in ('r', 'b', 'n'):
+                self.recording.key(key)
+            if key in ('h', ' '):
+                self.mobile.reset()
+                name = 'home_lift' if key == 'h' else 'stop'
                 if self.operation is not None and name != 'stop':
                     self.notice = '正在等待上一个操作结果'
                     return
                 self.operation = {'id': self.next_operation, 'name': name}
                 self.next_operation += 1
-                if key in ('q', '\x03'):
-                    self.quit_at = now
             elif key in MOTIONS:
                 if key in 'ik' and self.state.get('homing'):
                     self.notice = '升降正在回零，请等待完成后再按 I/K；空格可停止'
@@ -252,15 +254,30 @@ class LocalChassisKeyboard:
                 self.mobile.press(key, now)
 
     def command(self, now=None):
-        now = time.monotonic() if now is None else now
         with self.lock:
-            active = (now - self.received <= .5 and self.state.get('enabled')
-                      and not self.state.get('homing') and not self.state.get('feedback_paused')
-                      and not self.state.get('fault'))
-            return {
-                'commands': self.mobile.values(now) if active else [0.] * 4,
-                'operation': dict(self.operation) if self.operation is not None else None,
-            }
+            return self._command(time.monotonic() if now is None else now)
+
+    def _command(self, now):
+        active = (not self.quitting and now - self.received <= .5 and self.state.get('enabled')
+                  and not self.state.get('homing') and not self.state.get('feedback_paused')
+                  and not self.state.get('fault'))
+        return {
+            'commands': self.mobile.values(now) if active else [0.] * 4,
+            'operation': dict(self.operation) if self.operation is not None else None,
+        }
+
+    def send_reply(self, channel, reply, *, quit_sent):
+        with self.lock:
+            if self.quitting:
+                # Q and transmission share this lock. An already-started
+                # send may finish, but no later reply can include motion.
+                frame = {'sequence': reply['sequence']}
+                if not quit_sent:
+                    frame['quit'] = True
+                send_frame(channel, frame)
+                return True
+            send_frame(channel, {**reply, 'chassis': self._command(time.monotonic())})
+            return False
 
     def receive(self, request, now=None):
         now = time.monotonic() if now is None else now
@@ -277,14 +294,7 @@ class LocalChassisKeyboard:
                     return
                 self.notice = ('已接受：' if ack.get('accepted') else '已拒绝：') + str(ack.get('message', ''))
                 self.control_error = '' if ack.get('accepted') else self.notice
-                if self.quit_at is not None and self.operation['name'] == 'stop':
-                    self.quit_confirmed = ack.get('accepted') is True
                 self.operation = None
-
-    def should_quit(self):
-        with self.lock:
-            return self.quit_at is not None and (
-                self.quit_confirmed or time.monotonic() - self.quit_at >= 1.)
 
     def set_notice(self, notice):
         with self.lock:
@@ -292,7 +302,7 @@ class LocalChassisKeyboard:
 
     def run_console(self, stop):
         print('本地电脑控制：主臂连接后直接跟随；W/S 前后，A/D 左右，J/L 旋转，I/K 升降。')
-        print('H 升降下行回零，确保底部路径畅通；空格停车，Q 停车并退出主臂发送。')
+        print('H 升降下行回零，确保底部路径畅通；空格停车，Q 请求统一停车并等待确认。')
         lift, forward, lateral, yaw = MOBILE_ACTION_SCALE
         print(f'固定轴速度：前后 {forward:g} m/s，平移 {lateral:g} m/s，'
               f'旋转 {yaw:g} rad/s，升降 {lift:g} m/s；组合超轮速时等比例降速。')
@@ -303,15 +313,19 @@ class LocalChassisKeyboard:
             with ConsoleKeys() as console:
                 self._console_loop(stop, console)
         except KeyboardInterrupt:
-            self.handle_key('\x03')  # The control thread sends STOP and waits for its acknowledgement.
+            self.handle_key('\x03')  # The control thread requests the unified stop.
         print()
 
     def _console_loop(self, stop, console):
         last_draw = 0.
         printed_error = ''
         while not stop.is_set():
-            for key in self.mobile.poll(console):
-                self.handle_key(key)
+            keys = self.mobile.poll(console)
+            if 'q' in keys or '\x03' in keys:
+                self.handle_key('q')
+            else:
+                for key in keys:
+                    self.handle_key(key)
             now = time.monotonic()
             if now - last_draw >= .2:
                 with self.lock:
@@ -405,8 +419,20 @@ def run_leader(args):
             keyboard_worker.start()
             stack.callback(keyboard_worker.join)
             stack.callback(stop.set)
+        quit_sent = False
         while True:
             request = read_frame(channel)
+            if (stop_status := request.get('teleop_stop')) is not None:
+                reason, errors = stop_status['reason'], stop_status['errors']
+                if errors:
+                    raise ConnectionError(f'{reason}\n遥操保护停车未确认：' + '；'.join(errors))
+                if errors is not None:
+                    if quit_sent and stop_status.get('operator_exit'):
+                        print('遥操已退出，统一停车已确认。', flush=True)
+                        return
+                    raise ConnectionError(f'{reason}\n电机节点已确认保护停车。')
+                send_frame(channel, {'sequence': request['sequence']})
+                continue  # Wait for stop confirmation without sending motion or recording requests.
             if recording is not None:
                 recording.receive(request)
             if keyboard is not None:
@@ -423,13 +449,12 @@ def run_leader(args):
                 if frame.notice and keyboard is not None:
                     keyboard.set_notice(frame.notice)
             reply = {**sample, 'sequence': request['sequence'], 'sample_age_ns': age}
-            if keyboard is not None:
-                reply['chassis'] = keyboard.command()
             if recording is not None:
                 reply['recording'] = recording.command()
-            send_frame(channel, reply)
-            if keyboard is not None and keyboard.should_quit():
-                return
+            if keyboard is not None:
+                quit_sent = keyboard.send_reply(channel, reply, quit_sent=quit_sent)
+            else:
+                send_frame(channel, reply)
 
 
 def main(argv=None):

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Command deadlines at ROS receipt, controller execution and the serial boundary."""
 
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
@@ -29,14 +31,67 @@ class TestMobileDeadlines(unittest.TestCase):
         node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=now), get_logger=Mock(),
                                group_session_id='test-left')
         ros = object.__new__(ChassisRos)
+        ros.teleop_link = None
         ros.node, ros.control = node, control
         ros.pending_command, ros.latest_command_ns = None, 0
-        ros.teleop_fault = ''
+        ros.motion_fault = ''
         ros.recording_command_publisher = Mock()
         return ros, driver, clock, samples
 
-    def test_teleop_fault_cancels_active_homing_and_refuses_new_homing(self):
-        from std_msgs.msg import String
+    def result(self, ros):
+        return json.loads(ros.recording_command_publisher.publish.call_args.args[0].data)
+
+    def test_verified_zero_does_not_wait_for_a_feedback_poll_or_rewrite_speed(self):
+        ros, driver, clock, samples = self.make_ros()
+        command = mobile_message(ros.node, [0, 0, 0, 0], expires_ns=1_050_000_000)
+        writes = len(driver.writes)
+        clock[0] = 1.048  # The next feedback tick would be too late.
+        ros.mobile_command(command)
+        event = self.result(ros)
+        self.assertTrue(event['accepted'])
+        self.assertEqual(event['targets'], [0, 0, 0, 0])
+        self.assertEqual(event['accepted_ns'], 1_048_000_000)
+        self.assertEqual(len(driver.writes), writes)
+        self.assertIsNone(ros.pending_command)
+        clock[0] = 1.066
+        ros.control.observe(samples)
+        ros.record_mobile_command()
+        ros.recording_command_publisher.publish.assert_called_once()
+
+    def test_zero_after_motion_waits_for_a_verified_stop(self):
+        ros, driver, clock, samples = self.make_ros()
+        ros.mobile_command(mobile_message(ros.node, [0, 1, 0, 0]))
+        clock[0] = 1.01
+        ros.control.observe(samples)
+        ros.record_mobile_command()
+        self.assertTrue(any(driver.writes[-1].values()))
+        ros.recording_command_publisher.publish.reset_mock()
+        clock[0] = 1.02
+        ros.mobile_command(mobile_message(ros.node, [0, 0, 0, 0]))
+        ros.recording_command_publisher.publish.assert_not_called()
+        clock[0] = 1.03
+        ros.control.observe(samples)
+        ros.record_mobile_command()
+        self.assertFalse(any(driver.writes[-1].values()))
+        self.assertTrue(self.result(ros)['accepted'])
+
+    def test_zero_after_motion_with_failed_serial_readback_is_rejected(self):
+        ros, driver, clock, samples = self.make_ros()
+        ros.mobile_command(mobile_message(ros.node, [0, 1, 0, 0]))
+        clock[0] = 1.01
+        ros.control.observe(samples)
+        ros.record_mobile_command()
+        driver.fail_write = True
+        clock[0] = 1.02
+        ros.mobile_command(mobile_message(ros.node, [0, 0, 0, 0]))
+        clock[0] = 1.03
+        ros.control.observe(samples)
+        ros.record_mobile_command()
+        event = self.result(ros)
+        self.assertFalse(event['accepted'])
+        self.assertIn('velocity readback failure', event['error'])
+
+    def test_protective_stop_cancels_active_homing_and_refuses_new_homing(self):
         from std_srvs.srv import Trigger
         ros, driver, clock, samples = self.make_ros()
         ros.control.begin_home()
@@ -44,7 +99,7 @@ class TestMobileDeadlines(unittest.TestCase):
         ros.control.observe(samples)
         self.assertNotEqual(ros.control.sent[11], 0)
 
-        ros.on_teleop_fault(String(data='遥操已停止：right arm write failed'))
+        ros.protective_stop('right arm write failed')
         self.assertFalse(ros.control.homing)
         self.assertEqual(driver.writes[-1], dict.fromkeys(driver.velocity_owned, 0))
         self.assertIsNone(ros.control.height)
@@ -67,7 +122,8 @@ class TestMobileDeadlines(unittest.TestCase):
         ros.record_mobile_command()
         self.assertTrue(all(not any(row.values()) for row in driver.writes))
         self.assertEqual(ros.control.base, (0., 0., 0.))
-        ros.recording_command_publisher.publish.assert_not_called()
+        self.assertFalse(self.result(ros)['accepted'])
+        self.assertIn('expired in the ROS queue', self.result(ros)['error'])
         self.assertIn('expired in the ROS queue', ros.control.reason)
 
     def test_accepted_command_expiring_before_feedback_tick_is_not_written_or_acknowledged(self):
@@ -79,7 +135,8 @@ class TestMobileDeadlines(unittest.TestCase):
         ros.control.observe(samples)
         ros.record_mobile_command()
         self.assertTrue(all(not any(row.values()) for row in driver.writes))
-        ros.recording_command_publisher.publish.assert_not_called()
+        self.assertFalse(self.result(ros)['accepted'])
+        self.assertIn('expired before velocity confirmation', self.result(ros)['error'])
 
     def test_late_serial_confirmation_stops_immediately_and_cannot_acknowledge(self):
         ros, driver, clock, samples = self.make_ros()
@@ -96,7 +153,7 @@ class TestMobileDeadlines(unittest.TestCase):
         ros.record_mobile_command()
         self.assertFalse(any(driver.writes[-1].values()))
         self.assertFalse(ros.control.fault)  # Ordinary expiry is a stop, not an electrical fault.
-        ros.recording_command_publisher.publish.assert_not_called()
+        self.assertFalse(self.result(ros)['accepted'])
 
     def test_expiry_during_lift_enable_cannot_apply_partial_base_motion(self):
         ros, driver, clock, samples = self.make_ros()
@@ -157,6 +214,31 @@ class TestMobileDeadlines(unittest.TestCase):
         driver._send_joint_packet.assert_not_called()
         driver._receive.assert_not_called()
 
+    def test_disconnected_link_blocks_serial_motion_after_buffer_preparation(self):
+        import socket
+        from xyc_hardware.teleop_nodes import LeaderLink
+        from xyc.transport.teleop import MotionSessionEnded
+
+        for writer, values in ((JointDriver.write_arm_goals, {1: 2000}),
+                               (ChassisDriver.write_velocities, {8: 100, 11: 100})):
+            with self.subTest(writer=writer.__qualname__):
+                driver = object.__new__(ChassisDriver)
+                driver.port, driver.bus = Mock(), 'left'
+                driver.port.write.side_effect = len
+                link = LeaderLink()
+                driver.motion_gate = link.dispatch
+                robot, pc = socket.socketpair()
+                with robot, pc:
+                    link.connect('operator', robot)
+                    self.assertTrue(link.claim('operator'))
+                    driver.port.reset_input_buffer.side_effect = lambda: pc.shutdown(socket.SHUT_WR)
+                    with self.assertRaises(MotionSessionEnded):
+                        writer(driver, values)
+                    driver.port.write.assert_not_called()
+                    driver.port.reset_input_buffer.side_effect = None
+                    driver._send_joint_packet(1, 3, b'\x28\x00')  # Protective torque-off stays available.
+                    driver.port.write.assert_called_once()
+
     def test_arm_and_mobile_deadlines_are_checked_after_serial_buffer_preparation(self):
         for writer, values in ((JointDriver.write_arm_goals, {1: 2000}),
                                (ChassisDriver.write_velocities, {8: 100})):
@@ -169,6 +251,18 @@ class TestMobileDeadlines(unittest.TestCase):
                 with patch('xyc_hardware.arm_joint_control.time.monotonic', lambda: clock[0]):
                     with self.assertRaisesRegex(CommandExpired, 'serial port write'):
                         writer(driver, values, deadline=1.05)
+                driver.port.write.assert_not_called()
+                driver._receive.assert_not_called()
+
+    def test_fault_latched_during_serial_preparation_blocks_arm_and_mobile_writes(self):
+        for writer, values in ((JointDriver.write_arm_goals, {1: 2000}),
+                               (ChassisDriver.write_velocities, {8: 100})):
+            with self.subTest(writer=writer.__qualname__):
+                driver = object.__new__(ChassisDriver)
+                driver.port, driver.bus, driver._receive = Mock(), 'left', Mock()
+                driver.port.reset_input_buffer.side_effect = lambda: setattr(driver, 'motion_fault', 'peer disconnected')
+                with self.assertRaisesRegex(CommandExpired, 'peer disconnected'):
+                    writer(driver, values)
                 driver.port.write.assert_not_called()
                 driver._receive.assert_not_called()
 
@@ -212,7 +306,8 @@ class TestMobileDeadlines(unittest.TestCase):
         with patch('xyc_hardware.chassis_bridge.time.monotonic', lambda: clock[0]):
             PCChassisBridge.publish_velocity(bridge)
         keyboard = bridge.mobile_pub.publish.call_args.args[0]
-        model = SimpleNamespace(get_clock=ros.node.get_clock, mobile_pub=Mock())
+        model = SimpleNamespace(get_clock=ros.node.get_clock, mobile_pub=Mock(),
+                                lock=threading.RLock(), require_active_link=lambda: None)
         original = ros.node.get_clock().now().to_msg()
         clock[0] = 1.02
         MotionReplay._publish_mobile(model, [1, 1, 0, 0], stamp=original, expires_ns=1_050_000_000)

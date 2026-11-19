@@ -88,6 +88,7 @@ def test_target_expires_before_send_if_another_rpc_blocks_the_control_link(monke
         def __exit__(self, *args): pass
     client = object.__new__(motion.MotionClient)
     client._io_lock, client._closed, client._transport_error = DelayedLock(), False, None
+    client._rejection = None
     client._stop_keepalive, client.sequence = threading.Event(), 0
     send = Mock()
     monkeypatch.setattr(motion, 'send', send)

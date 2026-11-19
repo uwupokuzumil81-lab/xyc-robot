@@ -2,11 +2,11 @@
 
 import torch
 from torch import nn
-import numpy as np
 
 from xyc.contracts import ACTION, OBS_STATE
+from xyc.learning.dataset import live_observation_batch
 from xyc.learning.data_spec import SampleSpec, StatisticsSpec, ValidationSpec, MetricValue
-from xyc.images import decode_jpeg, resize_rgb
+from xyc.images import resize_rgb
 from xyc.runtime.strategies.base import ChunkExecutionSpec
 from .configuration_act import ACTConfig
 from .modeling_act import ACTPolicy
@@ -119,18 +119,7 @@ class ACTAdapter(nn.Module):
         return result
 
     def live_batch(self, observation):
-        """ACT-owned preprocessing for one canonical live robot observation."""
-        state = observation.get('state')
-        images = observation.get('images')
-        if (not isinstance(state, (tuple, list)) or len(state) != len(self.schema.state_names)
-                or not isinstance(images, dict) or set(images) != set(self.schema.cameras)):
-            raise ValueError('Live ACT observation does not match the checkpoint schema')
-        batch = {OBS_STATE: torch.tensor([state], dtype=torch.float32)}
-        for name in self.schema.cameras:
-            rgb = decode_jpeg(images[name])
-            batch['observation.images.' + name] = torch.from_numpy(
-                np.ascontiguousarray(rgb)).permute(2, 0, 1).unsqueeze(0)
-        return batch
+        return live_observation_batch(observation, self.schema)
 
     def compute_loss(self, batch):
         self.train()

@@ -3,6 +3,7 @@
 from xyc.robot.profile import robot_profile
 
 import json
+import logging
 import math
 import socket
 import threading
@@ -12,9 +13,11 @@ from xyc.contracts import (
     ACTION_NAMES, ACTION_UNITS, COMMAND_VALIDITY_S, STATE_NAMES, STATE_UNITS, checked_action,
 )
 
-PROTOCOL = 'xyc.motion_replay.v3'
+PROTOCOL = 'xyc.motion_replay.v5'
 PORT = robot_profile().ports['motion']
 MAX_FRAME = 65536
+MOTION_IDLE_S = .5
+HOLD_IDLE_S = 5.
 
 
 def send(channel, message):
@@ -38,9 +41,14 @@ def receive(channel):
 
 
 class MotionRejected(RuntimeError):
-    def __init__(self, message, *, operation, snapshot=None):
+    def __init__(self, message, *, operation, snapshot=None, stop_confirmed=None, stop_error=''):
+        if stop_confirmed is False:
+            stop_error = stop_error or '后端尚未返回完整停车回执'
+            if stop_error not in message:
+                message += '\n停车未确认：' + stop_error
         super().__init__(message)
         self.operation, self.snapshot = operation, snapshot
+        self.stop_confirmed, self.stop_error = stop_confirmed, stop_error
 
 
 class MotionClient:
@@ -58,6 +66,7 @@ class MotionClient:
         self._stop_keepalive = threading.Event()
         self._closed = False
         self._transport_error = None
+        self._rejection = None
         self._keepalive_worker = None
         if keepalive_period is not None:
             if not 0 < keepalive_period <= .15:
@@ -67,14 +76,18 @@ class MotionClient:
                 target=self._keepalive, args=(keepalive_period,), name='xyc-motion-read-only-keepalive', daemon=True)
             self._keepalive_worker.start()
 
-    def call(self, operation, **payload):
+    def call(self, operation, *, before_send=None, **payload):
         started = time.monotonic()
         if operation == 'target':
             payload.setdefault('valid_for_s', COMMAND_VALIDITY_S)
         # One request owns send+receive together; keepalive cannot steal an action's reply.
         with self._io_lock:
+            if self._rejection is not None:
+                raise self._rejection
             if self._closed or self._stop_keepalive.is_set() or self._transport_error:
                 raise ConnectionError(self._transport_error or '运动控制连接已关闭；未自动重连或重发动作。')
+            if before_send is not None and not before_send():
+                return None
             if operation == 'target':
                 payload['valid_for_s'] -= time.monotonic() - started
                 if payload['valid_for_s'] <= 0:
@@ -92,8 +105,11 @@ class MotionClient:
             if result.get('accepted') is not True:
                 self.snapshot = result.get('snapshot', self.snapshot)
                 self.last_stop_confirmed = result.get('stop_confirmed') is True
-                raise MotionRejected(result.get('message', 'Motion command rejected'),
-                                     operation=operation, snapshot=self.snapshot)
+                self._rejection = MotionRejected(
+                    result.get('message', 'Motion command rejected'), operation=operation, snapshot=self.snapshot,
+                    stop_confirmed=result.get('stop_confirmed'), stop_error=result.get('stop_error', ''))
+                self._stop_keepalive.set()
+                raise self._rejection
             self.snapshot = result['snapshot']
             return self.snapshot
 
@@ -101,8 +117,11 @@ class MotionClient:
         while not self._stop_keepalive.wait(period):
             try:
                 # Read-only status keeps TCP alive but NEVER renews a moving base/lift goal.
-                # If the control loop stalls, the driver's original motion timeout still stops it.
                 self.call('status')
+            except MotionRejected as exc:
+                if exc.stop_confirmed is False:
+                    logging.getLogger(__name__).error('%s', exc)
+                return
             except (OSError, RuntimeError, ValueError):
                 self._stop_keepalive.set()
                 return
@@ -130,7 +149,7 @@ class MotionClient:
 class ReplaySession:
     """Exactly one client owns one replay; unknown outcomes are never retried.
 
-    The injected robot implements snapshot, start, home, target, renew and stop.
+    The injected robot implements snapshot, start, home, target, renew, stop and fault_stop.
     status is read-only. All writes require a successful prepare handshake.
     """
     def __init__(self, robot):
@@ -138,7 +157,10 @@ class ReplaySession:
         self.sequence = 0
         self.prepared = False
         self.started = False
+        self.faulted = False
+        self.stop_error = ''
         self.calibration_ids = None
+        self.activity_deadline = None
 
     def process(self, message):
         sequence = message.get('sequence')
@@ -148,6 +170,8 @@ class ReplaySession:
         operation = message.get('operation')
         if operation == 'status':
             return self.robot.snapshot()
+        if self.faulted:
+            raise ValueError('Motion session is faulted; restart the backend after inspection')
         if operation == 'prepare':
             if self.prepared or message.get('protocol') != PROTOCOL:
                 raise ValueError('Replay protocol mismatch or repeated preparation')
@@ -164,6 +188,9 @@ class ReplaySession:
             return state
         if not self.prepared:
             raise ValueError('Prepare the replay before issuing commands')
+        if operation == 'fault':
+            self.disconnect('Motion client aborted after an execution failure')
+            return self.robot.snapshot()
         if operation in ('stop', 'finish'):
             self.robot.stop(freeze_arms=operation != 'finish')
             self.started = False
@@ -173,6 +200,7 @@ class ReplaySession:
                 raise ValueError('Replay already started')
             self.started = True
             self.robot.start(self.calibration_ids)
+            self.activity_deadline = time.monotonic() + HOLD_IDLE_S
             return self.robot.snapshot()
         if not self.started:
             raise ValueError('Replay is not started')
@@ -181,7 +209,12 @@ class ReplaySession:
             raise ValueError('Follower calibration changed during replay')
         if not state.get('ready'):
             raise ValueError('Replay feedback not ready: ' + str(state.get('reason') or 'missing feedback'))
-        if operation == 'home':
+        # Read-only requests never extend the control loop's operating lease.
+        self.activity_deadline = time.monotonic() + MOTION_IDLE_S
+        if operation == 'hold':
+            self.robot.stop()
+            self.activity_deadline = time.monotonic() + HOLD_IDLE_S
+        elif operation == 'home':
             self.robot.home()
         elif operation == 'heartbeat':
             self.robot.renew()
@@ -203,9 +236,12 @@ class ReplaySession:
             raise ValueError('Unknown replay operation')
         return self.robot.snapshot()
 
-    def disconnect(self):
-        try:
-            if self.started:
-                self.robot.stop()
-        finally:
+    def disconnect(self, reason='Motion client disconnected during an active session'):
+        if self.started:
             self.started = False
+            self.faulted = True
+            try:
+                self.robot.fault_stop(reason)
+            except Exception as exc:
+                self.stop_error = str(exc)
+                raise

@@ -64,7 +64,7 @@ class FakeRobot:
         self.ids, self.height = ids, height
         self.arms = [0.] * 14
         self.enabled = False
-        self.commands, self.stops = [], []
+        self.commands, self.stops, self.faults = [], [], []
         self.starts = self.homes = self.heartbeats = 0
 
     def snapshot(self):
@@ -89,6 +89,9 @@ class FakeRobot:
 
     def stop(self, *, freeze_arms=True):
         self.stops.append(freeze_arms)
+
+    def fault_stop(self, reason):
+        self.faults.append(reason)
 
 
 class FakeClient:
@@ -233,7 +236,8 @@ def test_feedback_fault_and_calibration_change_have_distinct_errors(dataset):
         client.call('heartbeat')
 
 
-def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(dataset):
+@pytest.mark.parametrize('confirmed', (True, False))
+def test_rejected_tcp_reply_preserves_fault_snapshot_and_stop_detail(confirmed):
     protocol = motion
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
@@ -241,6 +245,7 @@ def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(datase
     messages = []
     snapshot = {'ready': False, 'reason': 'ID 11 持续过流：5.23 A',
                 'chassis': {'fault': 'ID 11 持续过流：5.23 A'}}
+    stop_error = '' if confirmed else 'right arm_right_shoulder_pan: torque-off unconfirmed'
     def serve():
         connection, _ = listener.accept()
         with connection, connection.makefile('rwb') as channel:
@@ -248,7 +253,7 @@ def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(datase
             messages.append(message)
             protocol.send(channel, {'sequence': message['sequence'], 'protocol': protocol.PROTOCOL,
                                     'accepted': False, 'message': snapshot['reason'], 'snapshot': snapshot,
-                                    'stop_confirmed': True})
+                                    'stop_confirmed': confirmed, 'stop_error': stop_error})
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
     client = MotionClient('127.0.0.1', listener.getsockname()[1], keepalive_period=None)
@@ -256,7 +261,13 @@ def test_rejected_tcp_reply_preserves_fault_snapshot_without_motion_retry(datase
         with pytest.raises(RuntimeError, match='ID 11') as caught:
             client.call('heartbeat')
         assert caught.value.snapshot == snapshot and client.snapshot == snapshot
-        assert client.last_stop_confirmed is True
+        assert client.last_stop_confirmed is confirmed
+        assert caught.value.stop_error == stop_error
+        if not confirmed:
+            assert stop_error in str(caught.value)
+        with pytest.raises(motion.MotionRejected) as repeated:
+            client.call('fault')
+        assert repeated.value is caught.value
     finally:
         client.close()
         worker.join(2.)
@@ -313,7 +324,7 @@ def test_unknown_target_reply_is_not_retried_and_stops(dataset, tmp_path):
     with pytest.raises(TimeoutError, match='reply lost'):
         execute(plan, output_dir=tmp_path / 'lost', client_factory=lambda *_: client,
                 clock=clock, sleep=clock.sleep, progress=lambda _: None)
-    assert len(robot.commands) == 4 and robot.stops == [True]
+    assert len(robot.commands) == 4 and len(robot.faults) == 1 and not robot.stops
     meta = json.loads((tmp_path / 'lost/meta.json').read_text())
     assert meta['status'] == 'failed' and meta['stop_confirmed'] is True
 
@@ -329,7 +340,28 @@ def test_partial_start_failure_still_stops(dataset):
     robot.start = broken
     with pytest.raises(RuntimeError): client.call('start')
     client.close()
-    assert robot.stops == [True]
+    assert len(robot.faults) == 1 and not robot.stops
+
+
+def test_fault_stop_failure_is_retained_and_session_cannot_restart(dataset):
+    plan = ReplayPlan(dataset)
+    robot = FakeRobot(plan.ids)
+    client = FakeClient(robot)
+    prepare(client, plan)
+    client.call('start')
+
+    def stop_failure(reason):
+        robot.faults.append(reason)
+        raise RuntimeError('right stop reply lost')
+
+    robot.fault_stop = stop_failure
+    with pytest.raises(RuntimeError, match='stop reply lost'):
+        client.call('fault')
+    assert client.session.stop_error == 'right stop reply lost'
+    with pytest.raises(ValueError, match='faulted'):
+        client.call('start')
+    client.close()
+    assert len(robot.faults) == 1 and robot.starts == 1
 
 
 def test_real_tcp_framing_and_repeated_sequence_rejected(dataset):

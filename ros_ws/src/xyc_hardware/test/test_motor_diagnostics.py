@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import MagicMock
 
 import rclpy
-from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from xyc_interfaces.srv import ProtectiveStop
 
 from xyc.robot.calibration import arm_names
 from xyc_hardware.arm_joint_control import BoundJointDriver
@@ -87,20 +87,26 @@ class TestMotorDiagnostics(unittest.TestCase):
         self.owner.get_logger = lambda: logger
         release = MagicMock(side_effect=OSError('unconfirmed release'))
         self.owner.arm_transaction = SimpleNamespace(protective_release=release)
-        MotorStateNode.stop_arm(self.owner, 'Motor node shutdown')
-        release.assert_called_once_with('Motor node shutdown')
+        self.owner.motion_fault, self.owner.stop_confirmed = 'fault', False
+        self.owner.chassis = None
+        self.owner.stop_arm = lambda reason: MotorStateNode.stop_arm(self.owner, reason)
+        response = MotorStateNode.protective_stop(self.owner, ProtectiveStop.Response())
+        self.assertFalse(response.success)
+        release.assert_called_once_with('fault')
         logger.error.assert_called_once()
         self.assertIn('unconfirmed release', logger.error.call_args.args[0])
 
-    def test_teleop_fault_stops_arm_even_when_chassis_stop_raises(self):
+    def test_protective_stop_stops_arm_even_when_chassis_stop_raises(self):
         error = OSError('lost zero-speed write')
         self.owner.chassis = MagicMock()
-        self.owner.chassis.on_teleop_fault.side_effect = error
-        self.owner.stop_arm = MagicMock()
-        fault = String(data='遥操已停止：test fault')
-        with self.assertRaisesRegex(OSError, 'lost zero-speed write'):
-            MotorStateNode.on_teleop_fault(self.owner, fault)
-        self.owner.stop_arm.assert_called_once_with(fault.data)
+        self.owner.chassis.protective_stop.side_effect = error
+        self.owner.stop_arm = MagicMock(return_value=None)
+        self.owner.motion_fault, self.owner.stop_confirmed = 'test fault', False
+        self.owner.get_logger = MagicMock()
+        response = MotorStateNode.protective_stop(self.owner, ProtectiveStop.Response())
+        self.assertFalse(response.success)
+        self.assertIn('lost zero-speed write', response.message)
+        self.owner.stop_arm.assert_called_once_with('test fault')
 
     def test_alternating_log_levels_do_not_crash_the_node(self):
         owns_context = not rclpy.ok()

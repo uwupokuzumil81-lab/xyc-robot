@@ -51,7 +51,8 @@ def dataset_root(tmp_path_factory):
                          + [float((frame + d) % 3 - 1) for d in range(4)],
                  'episode_index': episode, 'frame_index': frame} for frame in range(6)]
         pq.write_table(pa.Table.from_pylist(rows), root / f'data/chunk-000/file-{episode:03d}.parquet')
-        meta = {'episode_index': episode, 'length': 6, 'data/chunk_index': 0, 'data/file_index': episode}
+        meta = {'episode_index': episode, 'length': 6, 'data/chunk_index': 0, 'data/file_index': episode,
+                'tasks': ['Pick up the block.']}
         for i, camera in enumerate(CAMERAS):
             key = 'observation.images.' + camera
             path = root / f'videos/{key}/chunk-000/file-{episode:03d}.mp4'

@@ -1209,6 +1209,7 @@ class TestJointControl(unittest.TestCase):
                     driver._request(joint_id, 3, b'\x1f\x00\x00')
                 self.assertEqual(serial.write.call_count, 0)
                 speed, acceleration = driver.motion_profile(joint_id)
+                self.assertEqual(speed, 2400)
                 profile = bytes([acceleration]) + (2010).to_bytes(2, 'little') + b'\x00\x00' + speed.to_bytes(2, 'little')
                 driver._request(joint_id, 3, bytes([41]) + profile)
                 packet = serial.write.call_args.args[0]

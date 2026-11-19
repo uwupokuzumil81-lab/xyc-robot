@@ -97,6 +97,8 @@ class RecorderNode(Node):
     def on_command(self, msg):
         try:
             event = json.loads(msg.data)
+            if event.get('accepted') is False:
+                return
             self.buffer.add_command(event)
             self.input_counts['command/' + event['kind']] += 1
         except (ValueError, TypeError, KeyError, AttributeError) as exc:

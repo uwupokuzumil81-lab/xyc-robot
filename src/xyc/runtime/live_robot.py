@@ -81,7 +81,10 @@ class RobotControlSink:
         self.started = False
         return result
 
-    def dispatch(self, command, *, sequence, valid_for_s):
+    def hold(self):
+        return self.client.call('hold')
+
+    def dispatch(self, command, *, sequence, valid_for_s, before_send=None):
         mobile = command['mobile_command']
         values = [*command['arm_position_normalized'],
                   mobile['lift'], mobile['x'], mobile['y'], mobile['yaw']]
@@ -89,7 +92,9 @@ class RobotControlSink:
         payload = {'action': values, 'valid_for_s': valid_for_s}
         if 'observation_time_ns' in command:
             payload['observation_time_ns'] = command['observation_time_ns']
-        snapshot = self.client.call('target', **payload)
+        snapshot = self.client.call('target', before_send=before_send, **payload)
+        if snapshot is None:
+            return None
         return CommandResult(
             accepted=True, command_id=str(sequence), source_time_ns=sent, source_clock='pc_wall',
             message='Unified robot controller accepted the model target',
@@ -98,12 +103,18 @@ class RobotControlSink:
             feedback_clock='robot_monotonic')
 
     def stop(self):
+        self._close('stop')
+
+    def fault_stop(self):
+        self._close('fault')
+
+    def _close(self, operation):
         if self.closed:
             return
         self.closed = True
         try:
-            if self.started:
-                self.client.call('stop')
+            if self.started and not self.client.last_stop_confirmed:
+                self.client.call(operation)
         finally:
             self.started = False
             self.client.close()
@@ -151,6 +162,7 @@ class LiveObservationClient:
                     'state_stamps_ns': list(aligned.state_stamps_ns),
                     'calibration_ids': list(aligned.calibration_ids), 'sessions': list(aligned.sessions),
                     'camera_skew_s': aligned.camera_skew_s,
+                    'observation_age_at_pairing_s': (now_ns - aligned.stamp_ns) / 1e9,
                     'observation_fetch_s': time.monotonic() - started,
                 }
         raise TimeoutError('Live observation alignment failed: ' + self.buffer.reason)

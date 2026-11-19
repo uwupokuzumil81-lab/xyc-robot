@@ -1,7 +1,7 @@
 from xyc.robot.profile import robot_profile
 # SPDX-License-Identifier: Apache-2.0
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable, Shutdown
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable, Shutdown
 from launch.event_handlers import OnShutdown
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -45,32 +45,13 @@ def generate_launch_description():
             ])),
             condition=IfCondition(LaunchConfiguration('with_cameras')),
         ),
-        GroupAction(
-            condition=IfCondition(LaunchConfiguration('with_motors')),
-            actions=[IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(PathJoinSubstitution([
-                    FindPackageShare('xyc_hardware'), 'launch', 'motors.launch.py',
-                ])),
-                launch_arguments={
-                    'calibrated': 'true',
-                    'group_mode': 'true',
-                    'command_source': 'teleop',
-                    'auto_hold': 'false',
-                    'compose_coordinator': 'true',
-                    'chassis_mode': LaunchConfiguration('chassis_mode'),
-                    'gripper_torque_limit_raw': LaunchConfiguration('gripper_torque_limit_raw'),
-                }.items(),
-            )],
-        ),
-        Node(package='xyc_hardware', executable='leader_state_bridge', output='screen',
-             parameters=[{'recording': ParameterValue(LaunchConfiguration('recording'), value_type=bool),
-                          'chassis_mode': ParameterValue(LaunchConfiguration('chassis_mode'), value_type=bool)}],
-             on_exit=Shutdown(reason='leader bridge process exited')),
-        Node(package='xyc_hardware', executable='teleop_controller', output='screen', parameters=[{
+        Node(package='xyc_hardware', executable='teleop_backend', output='screen', parameters=[{
+            'chassis_mode': ParameterValue(LaunchConfiguration('chassis_mode'), value_type=bool),
             'side': LaunchConfiguration('side'),
             'live': ParameterValue(LaunchConfiguration('live'), value_type=bool),
             'recording': ParameterValue(LaunchConfiguration('recording'), value_type=bool),
             'follow_mode': LaunchConfiguration('follow_mode'),
-            'start_when_ready': ParameterValue(LaunchConfiguration('with_motors'), value_type=bool),
-        }], on_exit=Shutdown(reason='teleop controller process exited')),
+            'with_motors': ParameterValue(LaunchConfiguration('with_motors'), value_type=bool),
+            'gripper_torque_limit_raw': ParameterValue(LaunchConfiguration('gripper_torque_limit_raw'), value_type=int),
+        }], on_exit=Shutdown(reason='teleop backend process exited')),
     ])

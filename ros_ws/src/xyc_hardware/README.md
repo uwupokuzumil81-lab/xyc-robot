@@ -25,7 +25,7 @@ PC tools/teleop_stream.py
   arm_joint_control / chassis_control -> servo bus
 ```
 
-`teleop.launch.py with_motors:=true` includes `motors.launch.py` internally.
+`teleop.launch.py with_motors:=true` runs both motor owners in the teleop backend process. Each bus has its own ROS executor, and both serial writers check the same leader connection before sending motion.
 Do not start a second motor launch on the same physical serial ports.
 The motors launch also supports calibrated, read-only feedback for diagnostics.
 Calibration remains a separate maintenance tool because it needs exclusive serial access.
@@ -54,6 +54,7 @@ hardware enable failures are reported without repeating the enable writes.
 | `arm_joint_control.py` | Shared motor transport, persistent targets, ownership and joint/contact protection |
 | `motor_state_node.py` | Exclusive bus owner, state publication, grouped arm transactions |
 | `arm_group_coordinator.py` | 14-target validation and coordination of the two bus owners |
+| `motion_stop.py` | Shared protective-stop requests and per-bus confirmations |
 | `xyc.transport.teleop` | PC/Pi wire format, frame validation and timing constants |
 | `xyc.teleop.mapping` | Following target calculation and source validation |
 | `teleop_nodes.py` | Leader receiver and ROS following controller |
@@ -76,6 +77,7 @@ velocity mode; lift jogging uses velocity mode and homing establishes a height r
 - `/robot/arms/start`: validate and hold all fourteen current arm positions.
 - `/robot/arms/set_targets`: one ordered fourteen-position `SetArmTargets` request.
 - `/motors/{left,right}/group/transaction`: internal prepare/commit endpoint.
+- `/motors/{left,right}/protective_stop`: shared fault stop and motion lockout for each bus.
 - `/motors/{left,right}/joint/status`: read-only ownership and fault diagnostics.
 - `/motors/{left,right}/joint/torque_status`: read actual torque registers.
 - `/robot/mobile/command`: one `xyc_interfaces/msg/MobileCommand` for lift/x/y/yaw, with strict ternary labels and an absolute ROS expiry time.
@@ -111,6 +113,12 @@ The same expiry reaches the controller tick and the shared serial send function,
 after input-buffer preparation and immediately before writing. Ordinary expiry stops mobile
 velocity and does not become a latched electrical fault. Acceptance events are published only
 after controller application; expired or unconfirmed targets never become dataset labels.
+Sustained teleoperation input loss, an active replay or policy disconnection, and a motion
+watchdog timeout request the same protective stop on both buses. Read-only TCP status
+traffic leaves the motion watchdog unchanged. The stop latches before serial cleanup,
+so a goal still waiting for its serial write is rejected.
+The arm owners release owned joints even when position feedback is unavailable. The left
+owner also zeros the wheels and lift and cancels homing. A fault stays latched until backend restart.
 If the replay or policy control process exits, ROS launch shuts down the motor owners.
 Their shared shutdown sends zero wheel/lift velocity, releases the velocity axes and
 turns off torque on owned arm joints so they stop tracking old goals.

@@ -28,16 +28,17 @@ def test_leaders_are_only_sampled_during_preparation_and_ports_close(monkeypatch
     source.open()
     try:
         time.sleep(.02)
-        assert samples == [] and source.targets([0.] * 14) is None
+        assert samples == [] and source.fresh_snapshot() is None
         source.resume()
-        target = None
+        frame = None
         deadline = time.monotonic() + .5
-        while target is None and time.monotonic() < deadline:
-            target = source.targets([0.] * 14)
+        while frame is None and time.monotonic() < deadline:
+            frame = source.fresh_snapshot()
             time.sleep(.005)
-        assert target == [10.] * 7 + [20.] * 7
+        assert frame.positions == {'left': [10.] * 7, 'right': [20.] * 7}
+        assert not frame.reused_positions
         source.pause()
-        assert source.targets([0.] * 14) is None
+        assert source.fresh_snapshot() is None
         time.sleep(.03)
         count = len(samples)
         time.sleep(.03)

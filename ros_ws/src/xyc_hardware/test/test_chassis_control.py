@@ -126,7 +126,8 @@ class TestChassisControl(unittest.TestCase):
         control.tracker = LiftTracker(control.lift_geometry, reference_id='test-reference',
                                       zero_tick=2000, reference_time_s=1.)
         ros = object.__new__(ChassisRos)
-        ros.teleop_fault = ''
+        ros.teleop_link = None
+        ros.motion_fault = ''
         ros.control, ros.pending_command, ros.latest_command_ns = control, None, 0
         ros.recording_command_publisher = MagicMock()
         ros.node = SimpleNamespace(group_session_id='left-test', get_logger=MagicMock(),
@@ -278,7 +279,8 @@ class TestChassisControl(unittest.TestCase):
         control, driver, _, _ = make_control()
         control.enable()
         ros = object.__new__(ChassisRos)
-        ros.teleop_fault = ''
+        ros.teleop_link = None
+        ros.motion_fault = ''
         ros.control, ros.last_status = control, time.monotonic()
         ros.pending_command = None
         ros.node = SimpleNamespace(get_logger=lambda: MagicMock())
@@ -499,8 +501,10 @@ class TestChassisControl(unittest.TestCase):
                 control.enable()
                 control.begin_home()
                 ros = object.__new__(ChassisRos)
-                ros.teleop_fault = ''
+                ros.teleop_link = None
+                ros.motion_fault = ''
                 ros.latest_command_ns = 0
+                ros.pending_command = None
                 ros.control, ros.valid_command = control, MagicMock(side_effect=lambda msg: now[0] + .25)
                 for _ in range(6):
                     now[0] += .1
@@ -524,7 +528,8 @@ class TestChassisControl(unittest.TestCase):
         control, _, _, _ = make_control()
         control.reason = 'ID 8 寄存器核对失败'
         ros = object.__new__(ChassisRos)
-        ros.teleop_fault = ''
+        ros.teleop_link = None
+        ros.motion_fault = ''
         ros.latest_command_ns = 0
         ros.control, ros.valid_command = control, MagicMock(return_value=control.clock() + .25)
         ros.mobile_command(MobileCommand())
@@ -789,7 +794,7 @@ class TestPCChassisROS(unittest.TestCase):
         controller = TeleopController()
         self.addCleanup(controller.destroy_node)
         self.assertTrue(controller.live)
-        self.spin_until(lambda: controller.fault_publisher.get_subscription_count() == 2)
+        self.spin_until(controller.fault_stop.clients['left'].service_is_ready)
         self.connect_operator()
         chassis = self.motor.chassis
         self.operator.handle_key('h')
@@ -807,7 +812,7 @@ class TestPCChassisROS(unittest.TestCase):
         controller.pending.set_result(SetArmTargets.Response(accepted=False, message='right arm write failed'))
         controller.tick()
         self.assertTrue(controller.stopped)
-        self.spin_until(lambda: bool(self.keyboard.teleop_fault and chassis.teleop_fault))
+        self.spin_until(lambda: bool(self.keyboard.motion_fault and chassis.motion_fault))
         self.assertEqual(self.reader.writes[-1], dict.fromkeys(AXIS_IDS, 0))
         after_stop = len(self.reader.writes)
         self.assertIn('right arm write failed', self.keyboard.snapshot()['chassis_status']['fault'])

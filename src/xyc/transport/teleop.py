@@ -14,8 +14,13 @@ PORT = robot_profile().ports['teleop']
 REPLY_DEADLINE = .18
 INPUT_LOSS_DEADLINE = .35
 MAX_SAMPLE_AGE = .15
+MAX_FRAME_BYTES = 64 * 1024
 TARGET_COMMAND_EXPIRED = 'Target command expired'
 TELEOP_TARGET_DROPPED = 'Teleop target expired before commit'
+
+
+class MotionSessionEnded(ConnectionError):
+    """The teleoperation owner no longer authorizes a motion write."""
 
 
 def cadence(wait=time.sleep, *, period=PERIOD):
@@ -31,12 +36,15 @@ def cadence(wait=time.sleep, *, period=PERIOD):
 
 
 def send_frame(channel, frame):
-    channel.write(json.dumps(frame, allow_nan=False, separators=(',', ':')).encode('ascii') + b'\n')
+    data = json.dumps(frame, allow_nan=False, separators=(',', ':')).encode('ascii') + b'\n'
+    if len(data) > MAX_FRAME_BYTES:
+        raise ValueError('遥操消息过长')
+    channel.write(data)
     channel.flush()
 
 
 def read_frame(channel):
-    data = channel.readline(8192)
+    data = channel.readline(MAX_FRAME_BYTES)
     if not data:
         raise EOFError('连接已关闭')
     if not data.endswith(b'\n'):

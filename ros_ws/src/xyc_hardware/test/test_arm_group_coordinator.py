@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """ROS integration tests with fake drivers, enabled only in a separate domain."""
 import os
+import socket
 import threading
 import time
 import unittest
@@ -23,10 +24,11 @@ from xyc_interfaces.srv import ArmBusTransaction as ArmBusTransactionSrv, SetArm
 from xyc.robot.calibration import arm_names
 from xyc_hardware.arm_group_coordinator import ArmGroupCoordinator
 from xyc_hardware.arm_joint_control import ArmBusHold, ArmBusTransaction, JointControl
-from xyc_hardware.chassis_control import TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC
+from xyc_hardware.motion_stop import stop_service
+from xyc.contracts import CommandExpired
 from xyc_hardware.motor_state_node import MotorStateNode
-from xyc_hardware.teleop_nodes import TeleopController, LocalArmClient, controller_components
-from xyc.transport.teleop import TELEOP_TARGET_DROPPED
+from xyc_hardware.teleop_nodes import LeaderLink, LeaderStateBridge, TeleopController, LocalArmClient, controller_components
+from xyc.transport.teleop import INPUT_LOSS_DEADLINE, TELEOP_TARGET_DROPPED, read_frame, send_frame
 from xyc.transport.lease import BackendLease, running_backend_pids
 from test_arm_calibration import fixture
 from test_joint_control import FakeJoint
@@ -35,7 +37,10 @@ from test_joint_control import FakeJoint
 class FakeBus(Node):
     group_transaction = MotorStateNode.group_transaction
     command_deadline = MotorStateNode.command_deadline
-    on_teleop_fault = MotorStateNode.on_teleop_fault
+    protective_stop = MotorStateNode.protective_stop
+    install_protective_stop = MotorStateNode.install_protective_stop
+    request_protective_stop = MotorStateNode.request_protective_stop
+    complete_protective_stop = MotorStateNode.complete_protective_stop
     stop_arm = MotorStateNode.stop_arm
 
     def __init__(self, side):
@@ -43,6 +48,10 @@ class FakeBus(Node):
         self.side = side
         self.bus = side
         self.chassis = None
+        self.motion_fault = ''
+        self.teleop_link = None
+        self.reader = SimpleNamespace(motion_fault='')
+        self.stop_confirmed = False
         self.group_session_id = 'session' + side
         self.fail_target_commit = False
         self.operations = []
@@ -65,10 +74,13 @@ class FakeBus(Node):
         )
         self.arm_transaction = ArmBusTransaction(group, timeout_s=5.)
         self.service = self.create_service(ArmBusTransactionSrv, f'/motors/{side}/group/transaction', self.handle_transaction)
+        self.install_protective_stop()
         self.pub = self.create_publisher(ArmState, f'/motors/{side}/state', qos_profile_sensor_data)
         self.timer = self.create_timer(.05, self.publish_state)
 
     def write_arm_goals(self, goals, *, deadline):
+        if self.reader.motion_fault:
+            raise CommandExpired(self.reader.motion_fault)
         for motor in self.motors.values():
             if motor.joint_id in goals:
                 motor.write_goal(goals[motor.joint_id])
@@ -158,16 +170,12 @@ class TestArmGroupCoordinator(unittest.TestCase):
 
     def test_rejected_target_stops_both_arms_and_latches_their_old_session(self):
         buses = (self.left, self.right)
-        for bus in buses:
-            bus.create_subscription(String, TELEOP_FAULT_TOPIC, bus.on_teleop_fault, TELEOP_FAULT_QOS)
         controller = TeleopController()
         self.executor.add_node(controller)
         try:
             self.assertTrue(controller.live)
-            deadline = time.monotonic() + 3.
-            while controller.fault_publisher.get_subscription_count() < 2 and time.monotonic() < deadline:
-                time.sleep(.01)
-            self.assertEqual(controller.fault_publisher.get_subscription_count(), 2)
+            for client in controller.fault_stop.clients.values():
+                self.assertTrue(client.wait_for_service(timeout_sec=3.))
             self.assertTrue(self.call(self.start, Trigger.Request()).success)
             self.assertTrue(self.call(self.target, self.target_request()).accepted)
             joints = [joint for bus in buses for joint in bus.arm_transaction.group.controls.values()]
@@ -197,6 +205,233 @@ class TestArmGroupCoordinator(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'not idle'):
                     bus.arm_transaction.prepare_hold('100')
             self.assertEqual(writes, [joint.driver.writes for joint in joints])
+        finally:
+            self.executor.remove_node(controller)
+            controller.destroy_node()
+
+    def test_disconnect_rejects_queued_goals_and_relays_unconfirmed_joint_stop(self):
+        link = LeaderLink()
+        controller = TeleopController(link)
+        bridge = LeaderStateBridge(link)
+        controller.control_wake = None
+        controller.timer.cancel()  # Leave the last DDS frame queued in the controller.
+        self.coordinator.teleop_link = link
+        self.executor.add_node(controller)
+        finished = threading.Event()
+        queued = threading.Event()
+        release = threading.Event()
+        entered = []
+        worker_errors = []
+        check_time = self.coordinator.check_command_time
+
+        def pause_before_bus_dispatch(request):
+            check_time(request)
+            entered.append(request.sequence)
+            if len(entered) == 2:
+                queued.set()
+                if not release.wait(2.):
+                    raise TimeoutError('test did not release the arm transaction')
+
+        def serve(connection):
+            try:
+                with connection, connection.makefile('rwb') as channel:
+                    bridge.publish_session(channel, connection=connection)
+            except EOFError:
+                pass
+            except Exception as exc:
+                worker_errors.append(exc)
+            finally:
+                finished.set()
+
+        def wait_for(predicate, timeout=3.):
+            deadline = time.monotonic() + timeout
+            while not predicate() and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertTrue(predicate())
+
+        robot, pc = socket.socketpair()
+        first = threading.Thread(target=serve, args=(robot,), daemon=True)
+        try:
+            wait_for(lambda: bridge.outputs['right'].get_subscription_count() > 0)
+            first.start()
+            with pc, pc.makefile('rwb') as channel:
+                pc.settimeout(3.)
+                request = read_frame(channel)
+                send_frame(channel, {'sequence': request['sequence'], 'sample_id': 1,
+                                     'sample_age_ns': 0, 'positions': {'right': [35.] * 7},
+                                     'calibration_ids': {'right': 'a' * 64}})
+                wait_for(lambda: 'right' in controller.leaders and len(controller.followers) == 2)
+                self.assertTrue(self.call(self.start, Trigger.Request()).success)
+                failed = self.right.motors['arm_right_shoulder_pan']
+                failed.fail_release = True
+                with patch.object(self.coordinator, 'check_command_time', side_effect=pause_before_bus_dispatch):
+                    target = self.target.call_async(self.target_request())
+                    self.assertTrue(queued.wait(2.))
+                    pc.shutdown(socket.SHUT_WR)
+                    self.assertTrue(finished.wait(2.))
+                    release.set()
+                    wait_for(target.done)
+                    self.assertFalse(target.result().accepted)
+
+            self.assertIn('right', controller.leaders)
+            controller.tick()
+
+            def stop_completed():
+                controller.tick()
+                return not controller.stop_pending
+
+            wait_for(stop_completed)
+            self.assertEqual(controller.leaders, {})
+            self.assertTrue(controller.stopped)
+            for bus in (self.left, self.right):
+                self.assertNotIn('stream_targets', bus.operations)
+                self.assertIn('主臂连接', bus.motion_fault)
+            self.assertTrue(all(not motor.torque for bus in (self.left, self.right)
+                                for motor in bus.motors.values() if motor is not failed))
+
+            finished.clear()
+            robot, pc = socket.socketpair()
+            retry = threading.Thread(target=serve, args=(robot,), daemon=True)
+            retry.start()
+            with pc, pc.makefile('rwb') as channel:
+                pc.settimeout(3.)
+                setup = read_frame(channel)
+                errors = setup['teleop_stop']['errors']
+                self.assertTrue(any('arm_right_shoulder_pan' in error and 'torque-off not confirmed' in error
+                                    for error in errors))
+                send_frame(channel, {'sequence': setup['sequence'], 'sample_id': 1,
+                                     'sample_age_ns': 0, 'positions': {'right': [40.] * 7},
+                                     'calibration_ids': {'right': 'a' * 64}})
+                self.assertEqual(read_frame(channel)['teleop_stop']['errors'], errors)
+                pc.shutdown(socket.SHUT_WR)
+            retry.join(3.)
+            self.assertFalse(retry.is_alive())
+            self.assertEqual(controller.leaders, {})
+            self.assertEqual(worker_errors, [])
+        finally:
+            release.set()
+            pc.close()
+            if first.ident is None:
+                robot.close()
+            else:
+                first.join(3.)
+            self.executor.remove_node(controller)
+            controller.destroy_node()
+            bridge.destroy_node()
+
+    def test_disconnect_drops_requests_already_in_both_motor_node_queues(self):
+        link = LeaderLink()
+        self.coordinator.teleop_link = self.left.teleop_link = self.right.teleop_link = link
+        left_queued, right_queued, resume = (threading.Event() for _ in range(3))
+
+        class BlockMotor:
+            def __init__(self, queued):
+                self.queued = queued
+
+            def wait(self, timeout):
+                self.queued.set()
+                if not resume.wait(2.):
+                    raise TimeoutError('Motor queue test timed out')
+
+        robot, pc = socket.socketpair()
+        with robot, pc:
+            link.connect('operator', robot)
+            self.assertTrue(link.claim('operator'))
+            self.assertTrue(self.call(self.start, Trigger.Request()).success)
+            self.left.target_barrier = BlockMotor(left_queued)
+            self.right.target_barrier = BlockMotor(right_queued)
+            target = self.target.call_async(self.target_request())
+            try:
+                self.assertTrue(left_queued.wait(2.) and right_queued.wait(2.))
+                pc.shutdown(socket.SHUT_WR)
+                # Motor owners deliberately have not gotten any stop RPC.
+                self.assertFalse(self.left.motion_fault or self.right.motion_fault)
+            finally:
+                resume.set()
+            deadline = time.monotonic() + 3.
+            while not target.done() and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertTrue(target.done())
+            self.assertFalse(target.result().accepted)
+            self.assertIn('主臂连接', target.result().message)
+            self.assertTrue(all(sum(kind == 'goal' for kind, _ in motor.writes) == 1
+                                for bus in (self.left, self.right) for motor in bus.motors.values()))
+
+    def test_quit_relays_confirmed_unified_stop_once_and_never_accepts_more_motion(self):
+        self.assertTrue(self.call(self.start, Trigger.Request()).success)
+        link = LeaderLink()
+        controller = TeleopController(link)
+        bridge = LeaderStateBridge(link)
+        self.left.chassis = Mock()
+        self.executor.add_node(controller)
+        robot, pc = socket.socketpair()
+        failure = []
+
+        def serve():
+            try:
+                with robot, robot.makefile('rwb') as channel:
+                    bridge.publish_session(channel, connection=robot)
+            except EOFError:
+                pass
+            except Exception as exc:
+                failure.append(exc)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        frame = {'sample_id': 1, 'sample_age_ns': 0, 'positions': {'right': [25.] * 7},
+                 'calibration_ids': {'right': 'a' * 64}}
+        try:
+            with pc, pc.makefile('rwb') as channel:
+                pc.settimeout(3.)
+                request = read_frame(channel)
+                send_frame(channel, {'sequence': request['sequence'], 'quit': True})
+                for _ in range(200):
+                    request = read_frame(channel)
+                    status = request['teleop_stop']
+                    self.assertTrue(status['operator_exit'])
+                    if status['errors'] is not None:
+                        self.assertEqual(status['errors'], [])
+                        break
+                    send_frame(channel, {'sequence': request['sequence'], 'quit': True, **frame})
+                else:
+                    self.fail('No response to operator quit')
+                self.assertEqual(controller.leaders, {})
+                self.assertTrue(self.left.stop_confirmed and self.right.stop_confirmed)
+                self.assertTrue(all(not motor.torque for bus in (self.left, self.right)
+                                    for motor in bus.motors.values()))
+            worker.join(3.)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failure, [])
+            self.left.chassis.protective_stop.assert_called_once_with(
+                f'遥操已停止：{controller.link.stop_reason}')
+        finally:
+            pc.close()
+            worker.join(3.)
+            self.executor.remove_node(controller)
+            controller.destroy_node()
+            bridge.destroy_node()
+
+    def test_stalled_leader_latches_fault_and_rejects_next_arm_goal(self):
+        controller = TeleopController()
+        self.executor.add_node(controller)
+        try:
+            for client in controller.fault_stop.clients.values():
+                self.assertTrue(client.wait_for_service(timeout_sec=3.))
+            self.assertTrue(self.call(self.start, Trigger.Request()).success)
+            self.assertTrue(self.call(self.target, self.target_request()).accepted)
+            joints = [motor for bus in (self.left, self.right) for motor in bus.motors.values()]
+            self.assertTrue(all(motor.torque == 1 for motor in joints))
+            controller.last_input = time.monotonic() - INPUT_LOSS_DEADLINE - .01
+            controller.source_identity = ('lost-leader', ('a', 'b'))
+            deadline = time.monotonic() + 3.
+            while not all(motor.torque == 0 for motor in joints) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(controller.stopped)
+            self.assertIn('主臂持续断流', self.left.motion_fault)
+            self.assertTrue(all(motor.torque == 0 for motor in joints))
+            next_target = self.target_request()
+            next_target.sequence = 2
+            self.assertFalse(self.call(self.target, next_target).accepted)
         finally:
             self.executor.remove_node(controller)
             controller.destroy_node()
@@ -484,8 +719,8 @@ class TestBackendLease(unittest.TestCase):
             install = project / 'ros_ws/install'
             expected = {
                 111: install / 'xyc_hardware/lib/xyc_hardware/motor_state_node',
-                222: install / 'xyc_hardware/lib/xyc_hardware/leader_state_bridge',
-                333: Path(directory) / 'another/ros_ws/install/xyc_hardware/lib/xyc_hardware/leader_state_bridge',
+                222: install / 'xyc_hardware/lib/xyc_hardware/teleop_backend',
+                333: Path(directory) / 'another/ros_ws/install/xyc_hardware/lib/xyc_hardware/teleop_backend',
             }
             for pid, path in expected.items():
                 folder = proc / str(pid)
@@ -502,10 +737,28 @@ class TestBackendLease(unittest.TestCase):
 
 
 class TestTeleopAcknowledgement(unittest.TestCase):
+    def test_half_close_blocks_dispatch_before_socket_reader_observes_eof(self):
+        link = LeaderLink()
+        callback = Mock()
+        link.on_fault = callback
+        local, peer = socket.socketpair()
+        with local, peer:
+            link.connect('session', local)
+            self.assertTrue(link.claim('session'))
+            send = Mock()
+            link.dispatch(send, 'connected')
+            peer.shutdown(socket.SHUT_WR)
+            with self.assertRaisesRegex(ConnectionError, '主臂连接已断开'):
+                link.dispatch(send, 'stale')
+            self.assertFalse(link.accepts('session'))
+            send.assert_called_once_with('connected')
+            callback.assert_called_once()
+
     def test_event_wakeups_do_not_restart_a_latched_fault(self):
         node = SimpleNamespace(control_wake=Mock(), pending=None, leaders={}, stopped=False,
                                update_targets=Mock(side_effect=RuntimeError('hardware fault')),
-                               timer=Mock(), get_logger=Mock(), fault_publisher=Mock())
+                               timer=Mock(), get_logger=Mock(), fault_stop=Mock(), stop_pending=False, link=None)
+        node.fault_stop.poll.return_value = ()
         node.wake_control = lambda: TeleopController.wake_control(node)
         TeleopController.on_leader(node, 'left', 'first frame')
         node.control_wake.trigger.assert_called_once()
@@ -515,8 +768,8 @@ class TestTeleopAcknowledgement(unittest.TestCase):
         TeleopController.tick(node)
         node.control_wake.trigger.assert_called_once()
         node.update_targets.assert_called_once()
-        node.fault_publisher.publish.assert_called_once()
-        self.assertIn('hardware fault', node.fault_publisher.publish.call_args.args[0].data)
+        node.fault_stop.begin.assert_called_once()
+        self.assertIn('hardware fault', node.fault_stop.begin.call_args.args[0])
 
     def test_slow_acknowledgement_waits_and_expired_preflight_replans(self):
         reply = Mock()
@@ -542,44 +795,33 @@ class TestTeleopAcknowledgement(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '执行状态待查'):
             TeleopController.check_target_reply(node, 1.21)
 
-    def test_reconnect_waits_for_inflight_target_and_realigns_on_fresh_session(self):
+    def test_new_leader_connection_cannot_reuse_an_active_control_session(self):
         calibration = ('cal-left', 'cal-right')
-        node = SimpleNamespace(
-            source_identity=('old', calibration), last_leader_stamp_ns=900, pending=object(),
-            last_seen=42, last_planned=42, planner=object(), last_sent=[1.] * 14,
-            hold_confirmed_ns=800, last_plan_time=1.0, last_input=1.0, samples=42,
-            waiting_for_reconnect=True, get_logger=Mock(),
-        )
+        node = SimpleNamespace(source_identity=('old', calibration), last_seen=42, last_input=1.0, samples=42)
         accept = TeleopController.accept_leader_session
-        self.assertFalse(accept(node, 'new', calibration, 1, 1000, 2.0))
-        node.pending = None
-        self.assertFalse(accept(node, 'old', calibration, 42, 950, 2.0))
-        self.assertFalse(accept(node, 'new', calibration, 1, 899, 2.0))
-        with self.assertRaisesRegex(ValueError, '标定'):
-            accept(node, 'new', ('changed', 'cal-right'), 1, 1000, 2.0)
-        self.assertTrue(accept(node, 'new', calibration, 1, 1000, 2.0))
-        self.assertFalse(node.waiting_for_reconnect)
-        self.assertIsNone(node.planner)
-        self.assertIsNone(node.last_sent)
-        self.assertEqual((node.last_seen, node.last_planned, node.hold_confirmed_ns), (1, 0, 1000))
-        node.waiting_for_reconnect = True
-        self.assertTrue(accept(node, 'new', calibration, 2, 1100, 3.0))
-        self.assertFalse(node.waiting_for_reconnect)
+        with self.assertRaisesRegex(ValueError, '主臂连接'):
+            accept(node, 'new', calibration, 1, 2.0)
+        self.assertEqual(node.last_input, 1.)
+        accept(node, 'old', calibration, 42, 2.0)
+        self.assertEqual(node.last_input, 1.)
+        accept(node, 'old', calibration, 43, 3.0)
+        self.assertEqual((node.last_input, node.last_seen), (3.0, 43))
 
 
 @unittest.skipUnless(os.environ.get('XYC_ISOLATED_TEST') == '1' and
                      os.environ.get('ROS_DOMAIN_ID') == '181', 'requires isolated ROS domain 181')
 class TestMotorGroupInitialization(unittest.TestCase):
     def test_live_controller_composes_distinct_nodes_without_starting_motors(self):
-        rclpy.init(args=['--ros-args', '-r', '__node:=teleop_controller',
-                        '-p', 'live:=true', '-p', 'start_when_ready:=true'])
+        rclpy.init(args=['--ros-args', '-p', 'live:=true', '-p', 'with_motors:=true'])
         nodes = []
         try:
-            nodes = controller_components()
+            link = LeaderLink()
+            nodes = controller_components(link)
             self.assertEqual([node.get_name() for node in nodes],
                              ['teleop_controller', 'arm_group_coordinator'])
             self.assertTrue(nodes[0].client.in_process)
             self.assertTrue(nodes[0].start_client.in_process)
+            self.assertIs(nodes[0].link, nodes[1].teleop_link)
             self.assertEqual(nodes[1].phase, 'idle')
             self.assertEqual(nodes[1].source, 'teleop')
         finally:
@@ -608,7 +850,7 @@ class TestMotorGroupInitialization(unittest.TestCase):
             def verify_speed_units(self):
                 pass
             def motion_profile(self, motor_id):
-                return (2000, 100) if motor_id == 7 else (2400, 120)
+                return (2400, 100) if motor_id == 7 else (2400, 120)
             def write_arm_goals(self, goals, *, deadline):
                 FakeDriver.writes.append(('group_goals', goals))
             def read_arm_control_snapshot(self):
@@ -627,11 +869,14 @@ class TestMotorGroupInitialization(unittest.TestCase):
             node = None
             try:
                 with patch('xyc_hardware.motor_state_node.JointDriver', FakeDriver):
-                    node = MotorStateNode()
+                    link = LeaderLink()
+                    node = MotorStateNode(teleop_link=link)
+                    self.assertEqual(node.reader.motion_gate, link.dispatch)
                     self.assertTrue(node.group_mode)
                     self.assertEqual(set(node.joint_controls), set(names))
                     self.assertEqual(node.arm_transaction.group.state, 'idle')
-                    self.assertEqual(node.count_subscribers(TELEOP_FAULT_TOPIC), 1)
+                    services = dict(node.get_service_names_and_types())
+                    self.assertEqual(services[stop_service('right')], ['xyc_interfaces/srv/ProtectiveStop'])
                     self.assertEqual(FakeDriver.writes, [])
             finally:
                 if node is not None:

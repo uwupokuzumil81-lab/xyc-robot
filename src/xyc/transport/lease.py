@@ -9,7 +9,7 @@ def running_backend_pids(project, *, with_motors, with_cameras, recording, proc_
     from pathlib import Path
     install = Path(project).resolve() / 'ros_ws/install'
     executables = {str(install / 'xyc_hardware/lib/xyc_hardware' / name)
-                   for name in ('leader_state_bridge', 'teleop_controller', 'motion_replay')}
+                   for name in ('teleop_backend', 'motion_replay')}
     if with_motors:
         executables.update(str(install / 'xyc_hardware/lib/xyc_hardware' / name)
                            for name in ('motor_state_node', 'arm_group_coordinator'))

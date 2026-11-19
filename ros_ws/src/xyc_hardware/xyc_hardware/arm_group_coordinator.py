@@ -20,6 +20,7 @@ from xyc_interfaces.msg import ArmState
 from xyc_interfaces.srv import ArmBusTransaction, SetArmTargets
 
 from xyc.robot.calibration import arm_names
+from xyc_hardware.motion_stop import MotionFaultStop
 from xyc.transport.teleop import TARGET_COMMAND_EXPIRED, TELEOP_TARGET_DROPPED
 
 
@@ -28,8 +29,9 @@ class ArmTargetExpired(ValueError):
 
 
 class ArmGroupCoordinator(Node):
-    def __init__(self, **kwargs):
+    def __init__(self, *, teleop_link=None, **kwargs):
         super().__init__('arm_group_coordinator', **kwargs)
+        self.teleop_link = teleop_link
         self.declare_parameter('command_source', 'teleop')
         self.declare_parameter('auto_hold', False)
         self.source = self.get_parameter('command_source').value
@@ -48,6 +50,7 @@ class ArmGroupCoordinator(Node):
                                      callback_group=self.callbacks)
             for side in ('left', 'right')
         }
+        self.fault_stop = MotionFaultStop(self) if teleop_link is None else None
         self.state_subscriptions = [
             self.create_subscription(ArmState, f'/motors/{side}/state',
                                      lambda msg, side=side: self.on_state(side, msg),
@@ -121,7 +124,10 @@ class ArmGroupCoordinator(Node):
             if remaining <= 0:
                 raise ArmTargetExpired(f'{side}: {operation} expired before dispatch')
             wait = min(wait, remaining + .120)
-        future = client.call_async(request)
+        if self.teleop_link is not None and operation in ('prepare_hold', 'commit_hold', 'stream_targets'):
+            future = self.teleop_link.dispatch(client.call_async, request)
+        else:
+            future = client.call_async(request)
         deadline = time.monotonic() + wait
         # The client response already completes the future. Waiting for a
         # second executor callback adds scheduling latency on every bus call.
@@ -157,14 +163,12 @@ class ArmGroupCoordinator(Node):
                 errors.append(str(exc))
         return errors
 
-    def protective_release(self):
-        errors = []
-        for side in ('left', 'right'):
-            try:
-                self.call_bus(side, 'protective_release')
-            except Exception as exc:
-                errors.append(str(exc))
-        return errors
+    def protective_stop(self, reason):
+        if self.teleop_link is not None:
+            self.teleop_link.fail(str(reason))
+            return ()  # The teleop controller owns the stop request and its diagnostic.
+        self.fault_stop.begin(str(reason))
+        return self.fault_stop.wait()
 
     def start(self, request, response):
         if not self.mutex.acquire(blocking=False):
@@ -192,7 +196,8 @@ class ArmGroupCoordinator(Node):
             response.message = 'Both buses reported holding; hardware writes were sequential'
         except Exception as exc:
             self.phase = 'fault'
-            errors = self.protective_release() if committing else self.abort_prepared(prepared, token if prepared else 0)
+            errors = (self.protective_stop(exc) if committing else
+                      self.abort_prepared(prepared, token if prepared else 0))
             response.message = str(exc) + ('; cleanup unconfirmed: ' + '; '.join(errors) if errors else '')
         finally:
             self.mutex.release()
@@ -281,7 +286,7 @@ class ArmGroupCoordinator(Node):
                 return response
             if committing:
                 self.phase = 'fault'
-                errors = self.protective_release()
+                errors = self.protective_stop(exc)
             else:
                 errors = []  # Validation failed before any bus write.
             response.message = str(exc) + ('; cleanup unconfirmed: ' + '; '.join(errors) if errors else '')

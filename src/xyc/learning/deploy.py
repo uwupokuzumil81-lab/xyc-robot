@@ -4,6 +4,7 @@ from xyc.robot.profile import robot_profile
 from xyc.assets import follower_calibration_ids
 
 from pathlib import Path
+import sys
 import time
 
 from .checkpoint import load_checkpoint
@@ -19,11 +20,13 @@ from xyc.runtime.evaluation import EvaluationConsole
 
 
 def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion'], camera_url=None,
-           device='cuda', home_lift=False, steps=None, strategy='sync_chunk', task=None,
+           device='cuda', home_lift=False, steps=None, strategy='sync_chunk', action_steps=None, task=None,
            record=True, record_dir=None, record_video=False, interactive=True, prepare_mode='keyboard',
            checkpoint_selection='latest'):
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError('steps must be a positive integer')
+    if action_steps is not None and strategy != 'sync_chunk':
+        raise ValueError('--action-steps requires --strategy sync_chunk')
     if not record and (record_dir is not None or record_video):
         raise ValueError('Recording directory/video cannot be combined with record=False')
     if prepare_mode not in ('keyboard', 'teleop') or not interactive and prepare_mode != 'keyboard':
@@ -60,13 +63,14 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
                        'model_config': manifest['model_config'], 'statistics': manifest['statistics'],
                        'robot_assets': manifest['robot_assets'], 'device': str(device),
                        'strategy': strategy, 'task': task, 'interactive': interactive,
-                       'prepare_mode': prepare_mode,
+                       'prepare_mode': prepare_mode, 'action_steps_override': action_steps,
                        'source': {'host': host, 'port': port, 'camera_url': camera_url}}
             options = dict(schema=schema, metadata=context, record_video=record_video)
             recorder = (InferenceRecorder(record_dir, **options) if record_dir is not None else
                         InferenceRecorder.create(project_root() / 'outputs/inference', **options))
             print(f'实时推理记录：{recorder.path}', flush=True)
-        runner = PolicyRunner(adapter, strategy=strategy, recorder=recorder)
+        strategy_options = {'action_steps': action_steps} if action_steps is not None else None
+        runner = PolicyRunner(adapter, strategy=strategy, strategy_options=strategy_options, recorder=recorder)
         cameras = LiveCameraClient(camera_url or f"http://localhost:{robot_profile().ports['data']}", schema.cameras)
         sink = RobotControlSink(host, port)
         observations = LiveObservationClient(cameras, sink, calibration_ids)
@@ -101,22 +105,33 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
         period = 1. / schema.fps
         next_tick = time.monotonic()
         preparing = console is not None
-        needs_warmup = True
-        while steps is None or completed < steps:
+        needs_warmup = not runner.asynchronous
+        quitting = False
+        pending_key = None
+
+        def apply_transition(choice):
+            nonlocal preparing, quitting
+            if choice == 'prepare':
+                runner.reset()
+                preparing = True
+            elif choice == 'quit':
+                quitting = True
+            return choice == 'model'
+
+        def allow_action():
+            nonlocal pending_key
+            pending_key = console.read_model_key()
+            return pending_key is None
+
+        while not quitting and (steps is None or completed < steps):
             if preparing:
                 if not console.prepare(executor):
                     break
-                runner.reset()
                 next_tick = time.monotonic()
                 preparing = False
-                needs_warmup = True
-            if console is not None:
-                choice = console.model_keys(executor, sink.status(), completed)
-                if choice == 'quit':
-                    break
-                if choice == 'prepare':
-                    preparing = True
-                    continue
+                needs_warmup = not runner.asynchronous
+            if console is not None and not apply_transition(console.model_keys(executor, completed)):
+                continue
             tick_started = time.monotonic()
             observation = observations.capture()
             if task is not None:
@@ -125,6 +140,7 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
             provenance = {key: value for key, value in observation.items() if key != 'images'}
             if needs_warmup:
                 latency = runner.warmup(batch, observation=provenance)
+                sink.heartbeat()
                 needs_warmup = False
                 next_tick = time.monotonic()
                 if console is not None:
@@ -132,17 +148,22 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
                 else:
                     print(f'模型预热完成（{latency:.3f}s），预热动作未下发。', flush=True)
                 continue
-            videos = None
-            if record_video:
-                from xyc.images import decode_jpeg
-                videos = {name: decode_jpeg(data) for name, data in observation['images'].items()}
+            videos = observation['images'] if record_video else None
             result = executor.step(batch, observation=provenance, video_frames=videos,
-                                   deadline=tick_started + COMMAND_VALIDITY_S)
-            if result.accepted is not True:
-                raise RuntimeError(result.message or 'Model command was not accepted')
-            completed += 1
-            if console is None and (completed == 1 or completed % max(1, round(schema.fps)) == 0):
-                print(f'模型实时控制：{completed} 帧，目标 {schema.fps:g} Hz，后端已接受', flush=True)
+                                   deadline=tick_started + COMMAND_VALIDITY_S,
+                                   allow_dispatch=allow_action if console is not None else None)
+            if pending_key is not None:
+                key, pending_key = pending_key, None
+                apply_transition(console.apply_model_key(executor, completed, key))
+                continue
+            if result is not None:
+                if result.accepted is not True:
+                    raise RuntimeError(result.message or 'Model command was not accepted')
+                completed += 1
+                if console is None and (completed == 1 or completed % max(1, round(schema.fps)) == 0):
+                    print(f'模型实时控制：{completed} 帧，目标 {schema.fps:g} Hz，后端已接受', flush=True)
+            elif runner.asynchronous:
+                sink.heartbeat()  # Main-loop progress while waiting in the initial hold.
             elapsed = time.monotonic() - tick_started
             if elapsed > COMMAND_VALIDITY_S:
                 raise TimeoutError(f'Live policy tick took {elapsed:.3f}s; mobile watchdog cannot be renewed safely')
@@ -158,7 +179,7 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
     finally:
         try:
             if executor is not None:
-                executor.close()
+                executor.close(fault=error is not None and not isinstance(error, KeyboardInterrupt))
             elif sink is not None:
                 sink.stop()
             elif runner is not None:
@@ -167,6 +188,10 @@ def deploy(checkpoint, *, host='localhost', port=robot_profile().ports['motion']
             if error is None:
                 error = exc
                 raise
+            if exc is not error and str(exc) not in str(error):
+                print(f'停车未确认：{exc}', file=sys.stderr, flush=True)
+                if recorder is not None:
+                    recorder.event('stop_unconfirmed', message=str(exc))
         finally:
             try:
                 if recorder is not None:

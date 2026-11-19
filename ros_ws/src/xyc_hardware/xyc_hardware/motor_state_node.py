@@ -8,17 +8,19 @@ from pathlib import Path
 import time
 
 import rclpy
-from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.task import Future
 from rclpy.time import Time
 from rcl_interfaces.msg import ParameterDescriptor
 from std_srvs.srv import Trigger
 from std_msgs.msg import String
 
 from xyc_interfaces.msg import ArmState, MotorFeedback, MotorFeedbackArray
-from xyc_interfaces.srv import ArmBusTransaction as ArmBusTransactionSrv
+from xyc_interfaces.srv import ArmBusTransaction as ArmBusTransactionSrv, ProtectiveStop
 from xyc.robot.calibration import FEEDBACK_ENDPOINT_TOLERANCE_TICKS, arm_names, normalize_tick
 from xyc_hardware.arm_state import ArmStateConverter
 from xyc.robot.feetech import FeetechReader, MODEL_NAMES, decode_feedback
@@ -26,13 +28,29 @@ from xyc_hardware.arm_joint_control import (
     GRIPPER_TORQUE_LIMIT_RAW_DEFAULT, ArmBusHold, ArmBusTransaction,
     BoundJointDriver, JointControl, JointDriver,
 )
-from xyc_hardware.chassis_control import ChassisDriver, ChassisRos, TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC
+from xyc_hardware.chassis_control import ChassisDriver, ChassisRos
+from xyc_hardware.motion_stop import stop_service
 from xyc.transport.teleop import TARGET_COMMAND_EXPIRED
 
 
+def motor_launch_parameters(bus, calibration_dir, *, calibrated, group_mode,
+                            chassis_mode, gripper_torque_limit_raw):
+    from xyc.robot.profile import robot_profile
+
+    return {
+        **robot_profile().motor_parameters(bus),
+        'calibration_file': str(calibration_dir / f'{bus}.json') if calibrated else '',
+        'group_mode': group_mode,
+        'chassis_mode': chassis_mode and bus == 'left',
+        'gripper_torque_limit_raw': gripper_torque_limit_raw,
+        **({'poll_hz': 60.0, 'read_timeout_s': .014} if group_mode else {}),
+    }
+
+
 class MotorStateNode(Node):
-    def __init__(self):
-        super().__init__('motor_state')
+    def __init__(self, *, teleop_link=None, **kwargs):
+        super().__init__('motor_state', **kwargs)
+        self.teleop_link = teleop_link
         self.reader = None
         self.state_converter = None
         self.state_publisher = None
@@ -42,6 +60,8 @@ class MotorStateNode(Node):
         self.arm_transaction = None
         self.group_session_id = ''
         self.chassis = None
+        self.motion_fault = ''
+        self.stop_confirmed = False
         self._sequence = 0
         self._next_warning = 0.0
         self._next_state_warning = 0.0
@@ -54,9 +74,6 @@ class MotorStateNode(Node):
             self.declare_parameter('calibration_file', '')
             self.declare_parameter('group_mode', False, ParameterDescriptor(read_only=True))
             self.declare_parameter('chassis_mode', False, ParameterDescriptor(read_only=True))
-            command_source = self.declare_parameter(
-                'command_source', 'teleop', ParameterDescriptor(read_only=True),
-            ).value
             self.declare_parameter('gripper_torque_limit_raw', GRIPPER_TORQUE_LIMIT_RAW_DEFAULT,
                                    ParameterDescriptor(read_only=True))
             self.declare_parameter('motor_ids', Parameter.Type.INTEGER_ARRAY)
@@ -106,6 +123,8 @@ class MotorStateNode(Node):
                 clock_ns=lambda: self.get_clock().now().nanoseconds,
                 **control_options,
             )
+            if teleop_link is not None:
+                self.reader.motion_gate = teleop_link.dispatch
             self.reader.open()
             self.models = self.reader.read_models()
             for motor_id, expected in zip(self.ids, expected_models):
@@ -176,10 +195,10 @@ class MotorStateNode(Node):
                     self.torque_status_service = self.create_service(Trigger, 'joint/torque_status', self.read_torque_status)
                     self.get_logger().info('Seven-joint group ready; waiting for an explicit hold request')
             if chassis_mode:
-                self.chassis = ChassisRos(self, self.reader)
+                self.chassis = ChassisRos(self, self.reader, teleop_link=teleop_link)
                 self.get_logger().info('底盘/升降接口就绪；等待电脑遥操连接后自动准备')
-            if command_source == 'teleop' and (group_mode or chassis_mode):
-                self.create_subscription(String, TELEOP_FAULT_TOPIC, self.on_teleop_fault, TELEOP_FAULT_QOS)
+            if group_mode or chassis_mode:
+                self.install_protective_stop()
             self.publisher = self.create_publisher(
                 MotorFeedbackArray, 'feedback', qos_profile_sensor_data,
             )
@@ -357,8 +376,13 @@ class MotorStateNode(Node):
             transaction = self.arm_transaction
             token = str(request.token)
             response.session_id = self.group_session_id
+            if self.teleop_link is not None and request.operation in (
+                    'prepare_hold', 'commit_hold', 'stream_targets'):
+                self.teleop_link.require_active()
             if request.operation == 'inspect':
                 pass
+            elif self.motion_fault:
+                raise ValueError(self.motion_fault)
             elif request.session_id != self.group_session_id:
                 raise ValueError('Bus session changed; transaction rejected')
             elif request.operation == 'prepare_hold':
@@ -370,8 +394,6 @@ class MotorStateNode(Node):
                 transaction.apply_stream_targets(token, request.targets, deadline=deadline)
             elif request.operation == 'abort':
                 transaction.abort(token)
-            elif request.operation == 'protective_release':
-                transaction.protective_release('Coordinator reported a group failure')
             else:
                 raise ValueError('Unknown group transaction operation')
             response.success = True
@@ -393,14 +415,46 @@ class MotorStateNode(Node):
             raise ValueError('Target command has an invalid lifetime')
         return started + remaining
 
-    def on_teleop_fault(self, message):
-        if not message.data:
-            return
-        try:
-            if self.chassis is not None:
-                self.chassis.on_teleop_fault(message)
-        finally:
-            self.stop_arm(message.data)
+    def install_protective_stop(self):
+        # A stop can latch during serial preflight. Only the default callback
+        # group executes serial I/O, including the verified stop below.
+        self.stop_guard = self.create_guard_condition(self.complete_protective_stop)
+        self.stop_callbacks = MutuallyExclusiveCallbackGroup()
+        self.create_service(ProtectiveStop, stop_service(self.bus), self.request_protective_stop,
+                            callback_group=self.stop_callbacks)
+
+    async def request_protective_stop(self, request, response):
+        self.motion_fault = self.motion_fault or request.reason or 'Motion control fault'
+        self.reader.motion_fault = self.motion_fault
+        if self.chassis is not None:
+            self.chassis.motion_fault = self.motion_fault
+        completion = Future(executor=self.executor)
+        self.stop_work = response, completion
+        self.stop_guard.trigger()
+        return await completion
+
+    def complete_protective_stop(self):
+        response, completion = self.stop_work
+        completion.set_result(self.protective_stop(response))
+
+    def protective_stop(self, response):
+        if self.stop_confirmed:
+            response.success, response.message = True, self.motion_fault
+            return response
+        failures = []
+        if self.chassis is not None:
+            try:
+                self.chassis.protective_stop(self.motion_fault)
+            except (OSError, ValueError, RuntimeError) as exc:
+                failures.append(f'base/lift: {exc}')
+        arm_error = self.stop_arm(self.motion_fault)
+        if arm_error:
+            failures.append(arm_error)
+        self.stop_confirmed = response.success = not failures
+        response.message = '; '.join(failures) if failures else self.motion_fault
+        if failures:
+            self.get_logger().error(f'{self.bus} 保护停车未确认：{response.message}')
+        return response
 
     def stop_arm(self, reason):
         if self.arm_transaction is None:
@@ -408,7 +462,7 @@ class MotorStateNode(Node):
         try:
             self.arm_transaction.protective_release(reason)
         except (OSError, ValueError, RuntimeError) as exc:
-            self.get_logger().error(f'{self.bus} 手臂保护停车未确认：{exc}')
+            return f'arm: {exc}'
 
     def destroy_node(self):
         try:
@@ -416,7 +470,8 @@ class MotorStateNode(Node):
                 if self.chassis is not None:
                     self.chassis.close()
             finally:
-                self.stop_arm('Motor node shutdown')
+                if arm_error := self.stop_arm('Motor node shutdown'):
+                    self.get_logger().error(f'{self.bus} 手臂保护停车未确认：{arm_error}')
         finally:
             try:
                 if self.reader is not None:
@@ -429,7 +484,7 @@ class MotorStateNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
-    executor = SingleThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=2)
     try:
         node = MotorStateNode()
         executor.add_node(node)

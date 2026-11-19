@@ -19,6 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from xyc.images import decode_jpeg
 from xyc.io import write_json
 
 
@@ -89,7 +90,8 @@ class InferenceRecorder:
 
     def _put(self, kind, row, images=None):
         size = len(json.dumps(row, allow_nan=False).encode('utf-8'))
-        size += sum(image.nbytes for image in (images or {}).values())
+        size += sum(len(image) if isinstance(image, bytes) else image.nbytes
+                    for image in (images or {}).values())
         with self._lock:
             if self._closing or self._closed:
                 raise RuntimeError('Inference recording is already closed')
@@ -162,12 +164,16 @@ class InferenceRecorder:
         copied = None
         if self.record_video:
             if images is None or set(images) != set(self.schema.cameras):
-                raise ValueError('Video recording requires one RGB uint8 HWC image per configured camera')
+                raise ValueError('Video recording requires one JPEG or RGB image per configured camera')
             copied = {}
             for name in self.schema.cameras:
-                value = np.asarray(images[name])
+                value = images[name]
+                if isinstance(value, bytes) and value.startswith(b'\xff\xd8'):
+                    copied[name] = value
+                    continue
+                value = np.asarray(value)
                 if value.dtype != np.uint8 or value.ndim != 3 or value.shape[2] != 3:
-                    raise ValueError('Recorded images must be RGB uint8 HWC')
+                    raise ValueError('Recorded images must be JPEG or RGB uint8 HWC')
                 copied[name] = np.ascontiguousarray(value).copy()
         self._put('selection', row, copied)
         return identity
@@ -286,6 +292,8 @@ class InferenceRecorder:
         import av
         rate = Fraction(str(self.schema.fps)).limit_denominator(100000)
         for name, image in images.items():
+            if isinstance(image, bytes):
+                image = decode_jpeg(image)
             if name not in videos:
                 container = av.open(str(self.path / 'videos' / (name + '.partial.mp4')), 'w', format='mp4')
                 stream = container.add_stream('libx264', rate=rate)

@@ -19,7 +19,7 @@ from xyc.robot.calibration import (
     position_target_tick,
 )
 from xyc.robot.feetech import FeetechReader, decode_feedback, signed_magnitude
-from xyc.transport.teleop import TARGET_COMMAND_EXPIRED
+from xyc.transport.teleop import MotionSessionEnded, TARGET_COMMAND_EXPIRED
 from xyc.contracts import CommandExpired
 from xyc_hardware.motor_safety import (
     CurrentProtection, FEEDBACK_LOSS_GRACE_S, MOTOR_TEMPERATURE_LIMIT_C, confirm_temperature,
@@ -29,7 +29,6 @@ from xyc_hardware.motor_safety import (
 ARM_ACCEL_RAW = 120
 ARM_SPEED_RAW = 2400
 GRIPPER_ACCEL_RAW = 100
-GRIPPER_SPEED_RAW = 2000
 ARRIVAL_WARNING_S = 3.0
 HOLD_WARNING_TICKS = 30
 HOLD_RECOVERY_TICKS = 10
@@ -57,6 +56,9 @@ ARM_LOAD_PROGRESS_TICKS = 3
 class JointDriver(FeetechReader):
     """Extra capability with a strict ID/register/profile whitelist."""
 
+    motion_fault = ''
+    motion_gate = None
+
     def __init__(self, device, motor_ids, *, bus, joint_id, **kwargs):
         expected = list(range(1, 12 if bus == 'left' else 8))
         if bus not in ('left', 'right') or list(motor_ids) != expected:
@@ -70,7 +72,7 @@ class JointDriver(FeetechReader):
     def motion_profile(self, motor_id):
         """Return the single continuous-control speed profile for an arm motor."""
         if motor_id == 7:  # Gripper on either arm bus.
-            return GRIPPER_SPEED_RAW, GRIPPER_ACCEL_RAW
+            return ARM_SPEED_RAW, GRIPPER_ACCEL_RAW
         return ARM_SPEED_RAW, ARM_ACCEL_RAW
 
     def _request(self, motor_id, instruction, parameters):
@@ -95,18 +97,25 @@ class JointDriver(FeetechReader):
                     allowed = 1 <= int.from_bytes(parameters[1:3], 'little') <= 1000
         if not allowed:
             return super()._request(motor_id, instruction, parameters)
-        self._send_joint_packet(motor_id, instruction, parameters)
+        moves = instruction == 3 and (parameters[0] == 41 or parameters == b'\x28\x01')
+        self._send_joint_packet(motor_id, instruction, parameters, moves=moves)
 
-    def _send_joint_packet(self, motor_id, instruction, parameters, *, deadline=None):
+    def _send_joint_packet(self, motor_id, instruction, parameters, *, deadline=None, moves=False):
         body = bytes([motor_id, len(parameters) + 2, instruction]) + parameters
         packet = b'\xff\xff' + body + bytes([(~sum(body)) & 255])
         attempts = 2 if instruction in (2, 0x82) else 1
-        for attempt in range(attempts):
-            self.port.reset_input_buffer()
+        def write():
+            if moves and self.motion_fault:
+                raise CommandExpired(self.motion_fault)
             if deadline is not None and time.monotonic() >= deadline:
                 raise CommandExpired('Command expired before serial port write')
+            return self.port.write(packet)
+
+        for attempt in range(attempts):
+            self.port.reset_input_buffer()
             try:
-                if self.port.write(packet) != len(packet):
+                written = self.motion_gate(write) if moves and self.motion_gate is not None else write()
+                if written != len(packet):
                     raise OSError(f'{self.bus} ID {motor_id}: incomplete instruction 0x{instruction:02x} transmission')
                 return
             except serial.SerialTimeoutException as exc:
@@ -212,7 +221,7 @@ class JointDriver(FeetechReader):
         encoded = {i: integer(goals[i], 0, 4095).to_bytes(2, 'little') for i in ids}
         # Startup has already verified each joint's speed and acceleration.
         payload = b''.join(bytes([i]) + encoded[i] for i in ids)
-        self._send_joint_packet(254, 0x83, b'\x2a\x02' + payload, deadline=deadline)
+        self._send_joint_packet(254, 0x83, b'\x2a\x02' + payload, deadline=deadline, moves=True)
         self._send_joint_packet(254, 0x82, b'\x2a\x02' + bytes(ids))
         replies = self._receive(ids, 2, .025)
         failed = [i for i in ids if i not in replies or replies[i].servo_error
@@ -933,6 +942,8 @@ class ArmBusHold:
                     measured_tick = denormalize_tick(control.entry, plan.current_normalized)
                     control._record_goal(plan.target_ticks, measured_tick)
         except BaseException as exc:
+            if isinstance(exc, MotionSessionEnded):
+                raise
             if isinstance(exc, CommandExpired):
                 raise ValueError(TARGET_COMMAND_EXPIRED) from exc
             if not attempted and isinstance(exc, ValueError) and str(exc) == TARGET_COMMAND_EXPIRED:

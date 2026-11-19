@@ -3,7 +3,10 @@
 from importlib import import_module
 
 
-POLICIES = {'act': ('xyc.models.act.adapter', 'ACTAdapter')}
+POLICIES = {
+    'act': ('xyc.models.act.adapter', 'ACTAdapter'),
+    'pi05': ('xyc.models.pi05.adapter', 'PI05Adapter'),
+}
 
 
 def policy_adapter(name):

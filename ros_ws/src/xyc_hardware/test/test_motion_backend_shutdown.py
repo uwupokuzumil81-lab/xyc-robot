@@ -60,6 +60,7 @@ def run_fake_motor_owner(side, directory):
                 control.observe(samples)
                 assert all(control.sent[motor_id] for motor_id in AXIS_IDS)
                 self.chassis = object.__new__(ChassisRos)
+                self.chassis.teleop_link = None
                 self.chassis.control = control
             (directory / f'{side}.ready').touch()
 

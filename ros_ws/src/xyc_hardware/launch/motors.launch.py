@@ -6,10 +6,10 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from xyc_hardware.motor_state_node import motor_launch_parameters
 
 
 def motor_nodes(context):
-    profile = robot_profile()
     calibrated = LaunchConfiguration('calibrated').perform(context) == 'true'
     group_mode = LaunchConfiguration('group_mode').perform(context) == 'true'
     auto_hold = LaunchConfiguration('auto_hold').perform(context) == 'true'
@@ -26,15 +26,11 @@ def motor_nodes(context):
             executable='motor_state_node',
             name='motor_state',
             namespace=f'/motors/{bus}',
-            parameters=[profile.motor_parameters(bus), {
-                'calibration_file': str(calibration_dir / f'{bus}.json') if calibrated else '',
-                'group_mode': group_mode,
-                'chassis_mode': chassis_mode and bus == 'left',
-                'command_source': command_source,
-                'gripper_torque_limit_raw': int(LaunchConfiguration(
+            parameters=[motor_launch_parameters(
+                bus, calibration_dir, calibrated=calibrated, group_mode=group_mode,
+                chassis_mode=chassis_mode, gripper_torque_limit_raw=int(LaunchConfiguration(
                     'gripper_torque_limit_raw').perform(context)),
-                **({'poll_hz': 60.0, 'read_timeout_s': .014} if group_mode else {}),
-            }],
+            )],
             output='screen',
             on_exit=Shutdown(reason=f'{bus} motor process exited'),
         ))

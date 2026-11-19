@@ -12,7 +12,7 @@ import shutil
 from uuid import uuid4
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_model, save_model
 
 from xyc.contracts import PolicySchema
 from .registry import make_policy, policy_adapter
@@ -21,6 +21,12 @@ from .data_spec import ValidationSpec
 FORMAT = 'xyc.policy.checkpoint.v1'
 
 
+def _weights_hash(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def committed_checkpoints(root):
@@ -90,12 +96,12 @@ def save_checkpoint(output_dir, adapter, manifest, training_state):
     stage = root / ('.checkpoint-' + uuid4().hex)
     stage.mkdir()
     try:
-        state = {key: tensor.detach().cpu().contiguous().clone() for key, tensor in adapter.state_dict().items()}
-        save_file(state, str(stage / 'model.safetensors'))
+        weights = stage / 'model.safetensors'
+        save_model(adapter, str(weights))
         torch.save(training_state, stage / 'training.pt')
         result = {**manifest, 'format': FORMAT,
                   'created_at_utc': datetime.now(timezone.utc).isoformat(),
-                  'weights_sha256': hashlib.sha256((stage / 'model.safetensors').read_bytes()).hexdigest()}
+                  'weights_sha256': _weights_hash(weights)}
         write_json(stage / 'manifest.json', result)
         os.replace(stage, target)
         refresh_checkpoint_indexes(root)
@@ -131,11 +137,11 @@ def load_checkpoint(path, *, device='cpu', selection='latest'):
     if manifest.get('format') != FORMAT:
         raise ValueError('Unsupported checkpoint format')
     weights = path / 'model.safetensors'
-    if hashlib.sha256(weights.read_bytes()).hexdigest() != manifest['weights_sha256']:
+    if _weights_hash(weights) != manifest['weights_sha256']:
         raise ValueError('Checkpoint weights hash mismatch')
     schema = PolicySchema.from_dict(manifest['schema'])
     adapter = make_policy(manifest['policy'], model_config=manifest['model_config'], schema=schema,
                           statistics=manifest['statistics'], initialize_pretrained=False)
-    adapter.load_state_dict(load_file(str(weights)), strict=True)
+    load_model(adapter, str(weights), strict=True)
     adapter.to(device).eval()
     return adapter, manifest, path

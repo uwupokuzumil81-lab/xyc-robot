@@ -63,7 +63,7 @@ class RecordingBridge(Node):
     def disconnect(self, session):
         with self.lock:
             if self.session == session:
-                self.session, self.received = None, 0.
+                self.session, self.received, self.packet = None, 0., None
                 self.disconnects.append(session)
 
     def snapshot(self):

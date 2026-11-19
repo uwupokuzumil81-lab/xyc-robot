@@ -1,6 +1,7 @@
 """Synchronous chunk queue and adapter-provided ensemble selection."""
 
 from collections import deque
+from dataclasses import replace
 
 from .base import ActionSelection, InferenceStrategy
 
@@ -10,10 +11,17 @@ class SyncChunkStrategy(InferenceStrategy):
 
     name = 'sync_chunk'
 
-    def __init__(self, adapter):
+    def __init__(self, adapter, *, action_steps=None):
         self.adapter = adapter
-        self.spec = adapter.chunk_execution_spec()
-        if self.spec.ensemble and not callable(getattr(adapter, 'ensemble_action', None)):
+        spec = adapter.chunk_execution_spec()
+        if action_steps is not None:
+            if type(action_steps) is not int or not 1 <= action_steps <= spec.horizon:
+                raise ValueError(f'--action-steps must be an integer from 1 to {spec.horizon}')
+            if spec.ensemble and action_steps != 1:
+                raise ValueError('Temporal ensembling requires --action-steps 1')
+            spec = replace(spec, action_steps=action_steps)
+        self.spec = spec
+        if spec.ensemble and not callable(getattr(adapter, 'ensemble_action', None)):
             raise ValueError('This adapter does not provide ensemble_action()')
         self.reset()
 

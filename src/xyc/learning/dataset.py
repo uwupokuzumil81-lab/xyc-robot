@@ -5,8 +5,24 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from xyc.contracts import ACTION, OBS_STATE
+from xyc.contracts import ACTION, OBS_IMAGES, OBS_STATE
+from xyc.images import decode_jpeg
 from .dataset_metadata import RGBVideos
+
+
+def live_observation_batch(observation, schema):
+    """Produce the same raw one-sample RGB/state/task batch as offline data."""
+    state, images = observation.get('state'), observation.get('images')
+    if (not isinstance(state, (tuple, list)) or len(state) != len(schema.state_names)
+            or not isinstance(images, dict) or set(images) != set(schema.cameras)):
+        raise ValueError('Live observation does not match the checkpoint schema')
+    batch = {OBS_STATE: torch.tensor([state], dtype=torch.float32)}
+    for name in schema.cameras:
+        rgb = decode_jpeg(images[name])
+        batch[f'{OBS_IMAGES}.{name}'] = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+    if 'task' in observation:
+        batch['task'] = [observation['task']]
+    return batch
 
 
 class EpisodeDataset(Dataset):
@@ -50,7 +66,7 @@ class EpisodeDataset(Dataset):
             images = [torch.from_numpy(self.reader.read(
                 path, offset + int(i) / self.metadata.schema.fps, self.metadata.schema.fps))
                 .permute(2, 0, 1).contiguous() for i in image_indices]
-            key = 'observation.images.' + camera
+            key = f'{OBS_IMAGES}.{camera}'
             result[key] = images[0] if self.spec.image_offsets is None else torch.stack(images)
             if self.spec.image_offsets is not None:
                 result[key + '_is_pad'] = padding

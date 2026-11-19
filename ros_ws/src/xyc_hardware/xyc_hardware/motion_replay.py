@@ -3,6 +3,7 @@
 
 import json
 import math
+import select
 import socket
 import threading
 import time
@@ -17,7 +18,8 @@ from std_srvs.srv import Trigger
 from xyc_interfaces.msg import ArmState, MobileCommand
 from xyc_interfaces.srv import SetArmTargets
 
-from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS, mobile_message
+from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS, COMMAND_RESULT_QOS, mobile_message
+from xyc_hardware.motion_stop import MotionFaultStop
 from xyc.contracts import ARM_NAMES, COMMAND_VALIDITY_S, checked_mobile_action
 from xyc.transport.motion import (
     PORT, PROTOCOL, ReplaySession, receive, send,
@@ -35,12 +37,17 @@ class MotionReplay(Node):
         self.condition = threading.Condition(self.lock)
         self.arms, self.mobile = {}, None
         self.arm_control = {}
-        self.accepted_mobile = {}
-        self.last_mobile = [0., 0., 0., 0.]
+        self.mobile_results = {}
+        self.last_mobile = None
         self.command_sequence = 0
         self.armed = False
+        self.motion_fault = ''
+        self.stop_error = None
+        self.fault_request = MotionFaultStop(self)
         self.closing = threading.Event()
         self.connection = None
+        self.session = self.peer_events = None
+        self.activity_timer = self.create_timer(.01, self.watch_session)
         self.targets = self.create_client(SetArmTargets, '/robot/arms/set_targets')
         self.start_arms = self.create_client(Trigger, '/robot/arms/start')
         self.owner = self.create_client(GetParameters, '/arm_group_coordinator/get_parameters')
@@ -52,7 +59,8 @@ class MotionReplay(Node):
             qos_profile_sensor_data) for side in ('left', 'right')]
         self.state_subscriptions += [
             self.create_subscription(String, '/robot/chassis/status', self._mobile, 1),
-            self.create_subscription(String, '/robot/chassis/recording_command', self._accepted, COMMAND_QOS)]
+            self.create_subscription(
+                String, '/robot/chassis/recording_command', self._mobile_result, COMMAND_RESULT_QOS)]
         self.state_subscriptions += [self.create_subscription(
             String, f'/motors/{side}/recording_sample', lambda msg, side=side: self._arm_control(side, msg),
             qos_profile_sensor_data) for side in ('left', 'right')]
@@ -91,22 +99,26 @@ class MotionReplay(Node):
         with self.lock:
             self.arm_control[side] = time.monotonic(), payload
 
-    def _accepted(self, message):
+    def _mobile_result(self, message):
         try:
             event = json.loads(message.data)
             identity = event['sequence']
         except (ValueError, KeyError):
             return
         with self.condition:
-            self.accepted_mobile[identity] = event
-            while len(self.accepted_mobile) > 64:
-                self.accepted_mobile.pop(next(iter(self.accepted_mobile)))
+            self.mobile_results[identity] = event
+            while len(self.mobile_results) > 64:
+                self.mobile_results.pop(next(iter(self.mobile_results)))
             self.condition.notify_all()
 
     def snapshot(self):
         with self.lock:
             now = time.monotonic()
             positions, ids, errors = [], [], []
+            if self.motion_fault:
+                errors.append(self.motion_fault)
+            if self.stop_error:
+                errors.append(self.stop_error)
             driver_targets, driver_target_ticks, driver_target_stamps = [], [], {}
             for index, side in enumerate(('left', 'right')):
                 entry = self.arms.get(side)
@@ -139,6 +151,8 @@ class MotionReplay(Node):
             height = mobile.get('height_m')
             velocity = mobile.get('base_measured') or [None] * 3
             return {'ready': not errors, 'arms_ready': arms_ready, 'reason': '; '.join(errors), 'calibration_ids': ids,
+                    'stop_confirmed': self.stop_error == '' if self.stop_error is not None else None,
+                    'stop_error': self.stop_error,
                     'state': [*positions, height, *velocity], 'chassis': mobile,
                     'driver_targets': driver_targets, 'driver_target_ticks': driver_target_ticks,
                     'driver_target_stamps_ns': driver_target_stamps,
@@ -160,14 +174,22 @@ class MotionReplay(Node):
             raise TimeoutError('ROS command deadline expired before dispatch')
         if not available:
             raise RuntimeError('Required replay ROS service is unavailable')
-        future = client.call_async(request)
-        while True:
-            if self.closing.is_set() or time.monotonic() >= deadline:
-                client.remove_pending_request(future)
-                raise TimeoutError('ROS reply timed out; command outcome unknown, not retried')
-            if future.done():
-                break
-            time.sleep(.001)
+        with self.lock:
+            self.require_active_link()
+            if time.monotonic() >= deadline:
+                raise TimeoutError('ROS command deadline expired before dispatch')
+            future = client.call_async(request)
+        try:
+            while True:
+                self.require_active_link()
+                if self.closing.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError('ROS reply timed out; command outcome unknown, not retried')
+                if future.done():
+                    break
+                time.sleep(.001)
+        except (OSError, RuntimeError):
+            client.remove_pending_request(future)
+            raise
         result = future.result()
         if result is None:
             raise RuntimeError('Empty ROS reply')
@@ -194,7 +216,7 @@ class MotionReplay(Node):
             self._trigger(self.start_arms)
         self.armed = True
         self._enable_mobile(ids)
-        self.last_mobile = [0., 0., 0., 0.]
+        self.last_mobile = None
         deadline = time.monotonic() + .8
         while not self.snapshot()['ready']:
             if time.monotonic() >= deadline:
@@ -228,7 +250,7 @@ class MotionReplay(Node):
 
     def home(self):
         self._trigger(self.mobile_services['home_lift'])
-        self.last_mobile = [0., 0., 0., 0.]
+        self.last_mobile = None
         self.renew()
 
     def _set_arms(self, positions, ids, *, valid_for_s=COMMAND_VALIDITY_S, stamp=None, deadline=None):
@@ -246,15 +268,18 @@ class MotionReplay(Node):
 
     def _publish_mobile(self, values, *, stamp=None, expires_ns=None):
         message = mobile_message(self, values, stamp=stamp, expires_ns=expires_ns)
-        if self.get_clock().now().nanoseconds >= message.expires_at.sec * 10**9 + message.expires_at.nanosec:
-            raise TimeoutError('Mobile command expired before ROS publication')
-        self.mobile_pub.publish(message)
+        with self.lock:
+            self.require_active_link()
+            if self.get_clock().now().nanoseconds >= message.expires_at.sec * 10**9 + message.expires_at.nanosec:
+                raise TimeoutError('Mobile command expired before ROS publication')
+            self.mobile_pub.publish(message)
         return message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
 
     def target(self, action, ids, *, valid_for_s):
         deadline = time.monotonic() + valid_for_s
         generated = self.get_clock().now().to_msg()
         lifetime = max(0., deadline - time.monotonic())
+        mobile = checked_mobile_action(action[14:])
         status = self.snapshot()
         if (not status['ready'] or not status['chassis'].get('enabled')
                 or status['chassis'].get('homing') or status['state'][14] is None):
@@ -264,44 +289,83 @@ class MotionReplay(Node):
         self._set_arms(action[:14], ids, valid_for_s=lifetime, stamp=generated, deadline=deadline)
         if time.monotonic() >= deadline:
             raise TimeoutError('Target deadline expired before base/lift dispatch')
-        mobile = checked_mobile_action(action[14:])
+        if mobile == self.last_mobile and not any(mobile):
+            current = self.snapshot()
+            if not current['ready']:
+                raise RuntimeError('Base/lift feedback unavailable: ' + current['reason'])
+            if current['chassis'].get('zero_targets_verified') is True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Target deadline expired before base/lift confirmation')
+                return
         expires_ns = generated.sec * 10**9 + generated.nanosec + int(lifetime * 1e9)
+        self.last_mobile = None  # An in-flight command invalidates the previous result.
         stamp = self._publish_mobile(mobile, stamp=generated, expires_ns=expires_ns)
         deadline = min(deadline, time.monotonic() + .2)
         with self.condition:
-            while stamp not in self.accepted_mobile:
+            while stamp not in self.mobile_results:
+                self.require_active_link()
                 if self.closing.is_set() or time.monotonic() >= deadline:
-                    raise TimeoutError('Base/lift acceptance not confirmed; stopping replay')
-                self.condition.wait(.002)
+                    raise TimeoutError('No base/lift command result before the deadline')
+                self.condition.wait(timeout=max(0., deadline - time.monotonic()))
+            event = self.mobile_results.pop(stamp)
+            if event.get('accepted') is not True:
+                raise RuntimeError('Base/lift command rejected: ' + event.get('error', 'missing confirmation status'))
             if time.monotonic() >= deadline:
                 raise TimeoutError('Target deadline expired before base/lift confirmation')
-            event = self.accepted_mobile[stamp]
             if event['targets'] != mobile:
                 raise RuntimeError('Base/lift accepted a different target')
         self.last_mobile = list(mobile)
 
     def renew(self):
-        self._publish_mobile(self.last_mobile)
+        self._publish_mobile(self.last_mobile if self.last_mobile is not None else [0.] * 4)
 
     def stop(self, *, freeze_arms=True):
-        self.last_mobile = [0., 0., 0., 0.]
-        self._publish_mobile(self.last_mobile)
-        failures = []
-        try:
-            self._trigger(self.mobile_services['stop'])
-        except Exception as exc:
-            failures.append(str(exc))
+        self.last_mobile = None
+        self._trigger(self.mobile_services['stop'])
+        self.last_mobile = [0.] * 4
         if freeze_arms and self.armed:
             state = self.snapshot()
-            if state['arms_ready']:
-                try:
-                    self._set_arms(state['state'][:14], state['calibration_ids'])
-                except Exception as exc:
-                    failures.append(str(exc))
-            else:
-                failures.append('Arm freeze could not be confirmed: ' + state['reason'])
-        if failures:
-            raise RuntimeError('Replay stop could not be fully confirmed: ' + '; '.join(failures))
+            if not state['arms_ready']:
+                raise RuntimeError('Arm hold could not be confirmed: ' + state['reason'])
+            self._set_arms(state['state'][:14], state['calibration_ids'])
+
+    def _begin_fault(self, reason):
+        if not self.motion_fault:
+            self.motion_fault = reason or 'Motion control fault'
+            self.last_mobile = None
+            self.fault_request.begin(self.motion_fault)
+            self.condition.notify_all()
+
+    def _link_failure(self):
+        if self.peer_events is not None and self.peer_events.poll(0):
+            return 'Motion control connection closed during an active request'
+        if (self.session is not None and self.session.started and self.session.activity_deadline is not None
+                and time.monotonic() >= self.session.activity_deadline):
+            return 'Motion control loop timed out waiting for a target or control heartbeat'
+        return ''
+
+    def watch_session(self):
+        with self.lock:
+            if self.session is not None and self.session.started and not self.motion_fault:
+                if reason := self._link_failure():
+                    self._begin_fault(reason)
+
+    def require_active_link(self):
+        with self.lock:
+            if reason := self.motion_fault or self._link_failure():
+                if self.session is not None and self.session.started:
+                    self._begin_fault(reason)
+                raise ConnectionError(reason)
+
+    def fault_stop(self, reason):
+        with self.lock:
+            self._begin_fault(reason)
+        errors = self.fault_request.wait()
+        error = 'Protective stop not confirmed: ' + '; '.join(errors) if errors else ''
+        with self.lock:
+            self.stop_error = error
+        if error:
+            raise RuntimeError(error)
 
     def _serve(self):
         while not self.closing.is_set():
@@ -311,8 +375,13 @@ class MotionReplay(Node):
                 continue
             except OSError:
                 break
-            self.connection = connection
             session = ReplaySession(self)
+            events = select.poll()
+            # Linux reports peer shutdown independently of the request reader,
+            # including while a synchronous ROS service is in progress.
+            events.register(connection, select.POLLRDHUP | select.POLLHUP | select.POLLERR)
+            with self.lock:
+                self.connection, self.session, self.peer_events = connection, session, events
             try:
                 connection.settimeout(.35)
                 connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -320,16 +389,20 @@ class MotionReplay(Node):
                     while not self.closing.is_set():
                         message = receive(channel)
                         try:
+                            if session.started:
+                                self.require_active_link()
                             result = session.process(message)
                         except Exception as exc:
-                            stopped, stop_error = True, ''
                             try:
-                                session.disconnect()
-                            except Exception as cleanup:
-                                stopped, stop_error = False, str(cleanup)
+                                session.disconnect(str(exc))
+                            except Exception:
+                                pass  # The session retains the unconfirmed stop error.
+                            stop_error = self.stop_error if self.motion_fault else session.stop_error
+                            if stop_error:
+                                self.get_logger().error(stop_error)
                             send(channel, {'sequence': message['sequence'], 'protocol': PROTOCOL,
                                            'accepted': False, 'message': str(exc), 'snapshot': self.snapshot(),
-                                           'stop_confirmed': stopped, 'stop_error': stop_error})
+                                           'stop_confirmed': stop_error == '', 'stop_error': stop_error or ''})
                             raise
                         send(channel, {'sequence': message['sequence'], 'protocol': PROTOCOL,
                                        'accepted': True, 'snapshot': result})
@@ -340,8 +413,9 @@ class MotionReplay(Node):
                     session.disconnect()
                 except Exception as exc:
                     self.get_logger().error(str(exc))
-                connection.close()
-                self.connection = None
+                with self.lock:
+                    self.connection = self.session = self.peer_events = None
+                    connection.close()
 
     def close(self):
         self.closing.set()

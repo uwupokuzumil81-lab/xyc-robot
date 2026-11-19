@@ -16,6 +16,8 @@ recording = ["xyc-robot[data]", "pandas>=2.2,<3"]
 replay = ["xyc-robot[data]"]
 act = ["xyc-robot[data,teleop]", "torch==2.7.1", "torchvision==0.22.1",
        "einops==0.8.1", "safetensors>=0.4,<1"]
+pi05 = ["xyc-robot[data,teleop]", "torch==2.7.1", "torchvision==0.22.1",
+        "transformers==5.3.0", "huggingface-hub>=1,<2", "safetensors>=0.8,<1"]
 
 [project.scripts]
 xyc-learning = "xyc.learning.cli:main"
@@ -28,5 +30,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "xyc.models.act" = ["LICENSE", "PROVENANCE.json"]
+"xyc.models.pi05" = ["LICENSE", "PROVENANCE.json"]
 
 "xyc.robot" = ["profile.yaml"]

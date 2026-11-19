@@ -64,8 +64,11 @@ def parser():
     deploy.add_argument('--camera-url', default=f"http://localhost:{robot_profile().ports['data']}")
     deploy.add_argument('--device', default='cuda')
     deploy.add_argument('--home-lift', action='store_true')
-    deploy.add_argument('--steps', type=int, help='Stop after this many control ticks; default runs until Ctrl+C')
-    deploy.add_argument('--strategy', choices=('sync_chunk', 'rtc'), default='sync_chunk')
+    deploy.add_argument('--steps', type=int, help='Stop after this many accepted commands; default runs until Ctrl+C')
+    deploy.add_argument('--strategy', choices=('sync_chunk', 'rtc'), default='sync_chunk',
+                        help='Use synchronous chunks or background RTC with a compatible adapter')
+    deploy.add_argument('--action-steps', type=int,
+                        help='Execute this many actions per predicted sync chunk; default uses the checkpoint setting')
     deploy.add_argument('--task', help='Task instruction for policies requesting language input')
     deploy.add_argument('--record-dir', help='New exclusive live inference trace directory')
     deploy.add_argument('--record-video', action='store_true', help='Save aligned live RGB observation videos')
@@ -96,7 +99,7 @@ def main(argv=None):
             from .trainer import train
             config = load_config(args.config)
             if args.command == 'smoke':
-                config = replace(config, device='cpu', precision='float32', steps=2, batch_size=1,
+                config = replace(config, device='cpu', precision='float32', steps=2, batch_size=1, warmup_steps=0,
                                  num_workers=0, save_every=2, eval_every=2, eval_batches=1, log_every=1,
                                  output_dir=str(project_root() / 'outputs' / (config.policy + '-smoke')))
             updates = {}
@@ -113,7 +116,7 @@ def main(argv=None):
             value = train(config, resume=getattr(args, 'resume', None))
             if args.command == 'smoke':
                 from .inference import predict_dataset
-                prediction = predict_dataset(value['checkpoint'], config.dataset,
+                prediction = predict_dataset(value['checkpoint'], config.dataset, record=False,
                                              output=Path(config.output_dir) / 'prediction.json')
                 value['prediction_shape'] = prediction['shape']
                 value['note'] = 'Reduced policy pipeline test; not a task-trained deployable policy'
@@ -122,6 +125,7 @@ def main(argv=None):
             value = deploy(args.checkpoint, host=args.host, port=args.port,
                            camera_url=args.camera_url, device=args.device,
                            home_lift=args.home_lift, steps=args.steps, strategy=args.strategy,
+                           action_steps=args.action_steps,
                            task=args.task, record=not args.no_record, record_dir=args.record_dir,
                            record_video=args.record_video, interactive=not args.auto_start,
                            prepare_mode=args.prepare_mode, checkpoint_selection=args.checkpoint_selection)

@@ -90,3 +90,43 @@ class FollowTargets:
         self.reference = list(targets)
         self.previous = list(targets)
         return targets
+
+
+# Units are the existing calibrated joint units, including gripper opening.
+ALIGNMENT_TOLERANCES = (2., 2., 2., 2., 2., 2., 1.) * len(SIDES)
+ALIGNMENT_FRAMES = 3
+
+
+class AlignedFollow:
+    """Engage absolute targets once the leader matches the measured follower."""
+
+    def __init__(self):
+        self.planner = None
+        self.engaged = False
+        self.errors = None
+        self.matches = 0
+        self.last_sample = None
+
+    def update(self, frame, follower):
+        if frame is None:
+            self.engaged = False
+            self.errors = None
+            self.matches = 0
+            return None
+        if self.planner is None:
+            self.planner = FollowTargets(frame.positions, follower, absolute=True)
+        targets = self.planner.update(frame.positions)
+        if self.engaged:
+            return targets
+
+        self.errors = [current - target for current, target in zip(follower, targets)]
+        if frame.reused_positions or any(abs(error) > limit
+                                         for error, limit in zip(self.errors, ALIGNMENT_TOLERANCES)):
+            self.matches = 0
+        elif frame.sample_id != self.last_sample:
+            self.matches += 1
+        self.last_sample = frame.sample_id
+        if self.matches >= ALIGNMENT_FRAMES:
+            self.engaged = True
+            return targets
+        return None

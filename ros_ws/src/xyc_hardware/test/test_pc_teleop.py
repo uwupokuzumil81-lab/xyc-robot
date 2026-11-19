@@ -72,6 +72,49 @@ class TestPCKeyboard(unittest.TestCase):
         local.close.assert_called_once()
         tunnel.assert_called_once_with('test-robot.local', 'operator')
 
+    def test_quit_key_clears_pending_chassis_operation_and_ignores_repeats(self):
+        recording = MagicMock()
+        keyboard = pc.LocalChassisKeyboard(recording)
+        keyboard.receive(response(), now=1.)
+        keyboard.handle_key('q', now=1.)
+        for key in ('Q', ' ', 'W', 'R'):
+            keyboard.handle_key(key, now=1.1)
+        self.assertTrue(keyboard.quitting)
+        self.assertEqual(keyboard.command(now=1.1), {'commands': [0.] * 4, 'operation': None})
+        recording.key.assert_not_called()
+
+    def test_stop_diagnostic_shows_the_arm_and_reason_without_keyboard(self):
+        import contextlib
+        import io
+        leaders = MagicMock()
+        leaders.snapshot.return_value = None
+        reason = '主臂连接中断'
+        error = 'right: arm: arm_right_shoulder_pan: torque-off not confirmed'
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            listener.settimeout(3.)
+            replies = []
+            def bridge():
+                connection, _ = listener.accept()
+                with connection, connection.makefile('rwb') as channel:
+                    connection.settimeout(3.)
+                    pc.send_frame(channel, {'sequence': 1, 'teleop_stop': {'reason': reason, 'errors': None}})
+                    replies.append(pc.read_frame(channel))
+                    pc.send_frame(channel, {'sequence': 2, 'teleop_stop': {'reason': reason, 'errors': [error]}})
+                    replies.append(connection.recv(1))
+            worker = threading.Thread(target=bridge, daemon=True)
+            worker.start()
+            output = io.StringIO()
+            with patch.object(pc, 'LeaderArms', return_value=leaders), patch.object(pc, 'PORT', listener.getsockname()[1]), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(pc.main(['leader', '--side', 'both', '--no-preview']), 1)
+            worker.join(3.)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(replies, [{'sequence': 1}, b''])
+        self.assertIn('遥操保护停车未确认', output.getvalue())
+        self.assertIn(error, output.getvalue())
+
     def test_preview_and_recording_use_a_separate_owned_ssh_connection(self):
         process = MagicMock()
         process.poll.return_value = None
@@ -276,7 +319,7 @@ class TestPCKeyboard(unittest.TestCase):
                 lower.handle_key(key, 1.01)
                 upper.handle_key(key.upper(), 1.01)
                 self.assertEqual(upper.command(1.02), lower.command(1.02))
-                self.assertEqual(upper.quit_at, lower.quit_at)
+                self.assertEqual(upper.quitting, lower.quitting)
 
     def test_key_release_and_stale_robot_status_produce_zero_velocity(self):
         keyboard = self.ready_keyboard()
@@ -315,14 +358,48 @@ class TestPCKeyboard(unittest.TestCase):
         keyboard.receive(response({'id': 3, 'accepted': True}), 1.14)
         self.assertIsNone(keyboard.command(1.15)['operation'])
 
-    def test_quit_waits_for_stop_confirmation_or_a_bounded_disconnect(self):
+    def test_quit_sends_one_stop_and_no_positions_even_with_a_sample_already_prepared(self):
         keyboard = self.ready_keyboard()
-        keyboard.handle_key('q', 1.1)
-        with patch.object(pc.time, 'monotonic', return_value=1.2):
-            self.assertFalse(keyboard.should_quit())
-        keyboard.receive(response({'id': 2, 'accepted': True}), 1.21)
-        with patch.object(pc.time, 'monotonic', return_value=1.22):
-            self.assertTrue(keyboard.should_quit())
+        leaders = MagicMock()
+
+        def sample():
+            # Simulate Q landing after the loop fetched the last leader observation.
+            keyboard.handle_key('q')
+            return types.SimpleNamespace(sample_id=1, stamp_ns=time.monotonic_ns(), error='', notice='',
+                positions={'right': [25.] * 7}, calibration_ids={'right': 'a' * 64})
+
+        leaders.snapshot.side_effect = sample
+        replies = []
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            listener.settimeout(3.)
+
+            def bridge():
+                connection, _ = listener.accept()
+                with connection, connection.makefile('rwb') as channel:
+                    connection.settimeout(3.)
+                    for i in (1, 2):
+                        pc.send_frame(channel, {'sequence': i, **response()})
+                        replies.append(pc.read_frame(channel))
+                    pending = {'reason': '操作员请求退出遥操', 'errors': None, 'operator_exit': True}
+                    pc.send_frame(channel, {'sequence': 3, 'teleop_stop': pending})
+                    replies.append(pc.read_frame(channel))
+                    pc.send_frame(channel, {'sequence': 4, 'teleop_stop': {**pending, 'errors': []}})
+                    replies.append(connection.recv(1))
+
+            worker = threading.Thread(target=bridge, daemon=True)
+            worker.start()
+            with patch.object(pc, 'PORT', listener.getsockname()[1]), \
+                    patch.object(pc, 'LeaderArms', return_value=leaders), \
+                    patch.object(pc, 'LocalChassisKeyboard', return_value=keyboard), \
+                    patch.object(pc.sys.stdin, 'isatty', return_value=True), \
+                    patch.object(keyboard, 'run_console', side_effect=lambda stop: stop.wait()):
+                args = types.SimpleNamespace(side='right', preview=False, keyboard=True, monitor=False)
+                pc.run_leader(args)
+            worker.join(3.)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(replies, [{'sequence': 1, 'quit': True}, {'sequence': 2}, {'sequence': 3}, b''])
 
     def test_server_capability_and_velocity_validation_reject_invalid_inputs(self):
         keyboard = pc.LocalChassisKeyboard()
@@ -427,5 +504,5 @@ class TestConsoleInterrupt(unittest.TestCase):
         with patch.object(pc, 'ConsoleKeys'), patch.object(
                 keyboard, '_console_loop', side_effect=KeyboardInterrupt):
             keyboard.run_console(threading.Event())
-        self.assertEqual(keyboard.operation['name'], 'stop')
-        self.assertIsNotNone(keyboard.quit_at)
+        self.assertIsNone(keyboard.operation)
+        self.assertTrue(keyboard.quitting)

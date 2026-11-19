@@ -8,12 +8,13 @@ import json
 import math
 import time
 
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from xyc_interfaces.msg import MobileCommand, MobileState
 
 from xyc.robot.calibration import integer
+from xyc.transport.teleop import MotionSessionEnded
 from xyc_hardware.arm_joint_control import JointDriver
 from xyc_hardware.motor_safety import (
     CurrentProtection, FEEDBACK_LOSS_GRACE_S,
@@ -36,10 +37,8 @@ HOMING_SPEED_M_S = .010
 HOMING_CONTACT_WINDOW_S = .10
 HOMING_CONTACT_RANGE_TICKS = 2
 STATIONARY_MAX_SAMPLE_GAP_S = .060
-COMMAND_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-TELEOP_FAULT_TOPIC = '/teleop/control_fault'
-TELEOP_FAULT_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                              reliability=ReliabilityPolicy.RELIABLE)
+COMMAND_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+COMMAND_RESULT_QOS = QoSProfile(depth=16, reliability=ReliabilityPolicy.RELIABLE)
 CHASSIS_NOT_READY = 'chassis_not_ready: '
 
 
@@ -92,7 +91,7 @@ class ChassisDriver(JointDriver):
         allowed |= address in (41, 85) and data == b'\xfe'
         if motor_id not in AXIS_IDS or not allowed:
             raise ValueError('Unsupported chassis configuration write')
-        self._send_joint_packet(motor_id, 3, bytes([address]) + data)
+        self._send_joint_packet(motor_id, 3, bytes([address]) + data, moves=address == 40 and data == b'\x01')
         reply = self._receive((motor_id,), 0, .02).get(motor_id)
         if reply is not None and reply.servo_error:
             raise ConnectionError(f'底盘/升降 ID {motor_id} 写入报错')
@@ -114,7 +113,7 @@ class ChassisDriver(JointDriver):
         payload = b''.join(bytes([i]) + encoded[i] for i in ids)
         if deadline is not None and time.monotonic() >= deadline and any(values.values()):
             raise CommandExpired('Mobile command expired before serial dispatch')
-        self._send_joint_packet(254, 0x83, b'\x2e\x02' + payload, deadline=deadline)
+        self._send_joint_packet(254, 0x83, b'\x2e\x02' + payload, deadline=deadline, moves=any(values.values()))
         self._send_joint_packet(254, 0x82, b'\x2e\x02' + bytes(ids))
         replies = self._receive(ids, 2, .025)
         failed = [i for i in ids if i not in replies or replies[i].servo_error
@@ -297,6 +296,11 @@ class ChassisControl:
         self.base, self.lift_speed = (0., 0., 0.), 0.
         self.mobile_until = 0.
 
+    def zero_targets_verified(self):
+        return (self.enabled and not (self.fault or self.feedback_paused or self.homing)
+                and not any(self.base) and self.lift_speed == 0.
+                and all(self.sent.get(axis) == 0 for axis in AXIS_IDS))
+
     def stop(self):
         self.clear_target()
         if self.homing:
@@ -465,6 +469,8 @@ class ChassisControl:
                     changed = dict.fromkeys(self.driver.velocity_owned, 0)
                     self.driver.write_velocities(changed)
                 self.sent.update(changed)
+        except MotionSessionEnded:
+            self.clear_target()  # The shared protection path owns the stop write.
         except (OSError, ValueError, RuntimeError) as exc:
             self.fail(str(exc))
 
@@ -545,8 +551,9 @@ class ChassisControl:
 class ChassisRos:
     """Attach to MotorStateNode. All serial work stays in that node's executor."""
 
-    def __init__(self, node, driver):
+    def __init__(self, node, driver, *, teleop_link=None):
         self.node = node
+        self.teleop_link = teleop_link
         def parameter(name, default):
             return node.declare_parameter(name, default).value
         defaults = robot_profile().geometry
@@ -561,12 +568,13 @@ class ChassisRos:
         self.control = ChassisControl(driver, geometry, lift)
         self.status = node.create_publisher(String, '/robot/chassis/status', 1)
         self.state_publisher = node.create_publisher(
-            MobileState, '/robot/chassis/state', COMMAND_QOS)
+            MobileState, '/robot/chassis/state',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.recording_command_publisher = node.create_publisher(
-            String, '/robot/chassis/recording_command', COMMAND_QOS)
+            String, '/robot/chassis/recording_command', COMMAND_RESULT_QOS)
         self.pending_command = None
         self.latest_command_ns = 0
-        self.teleop_fault = ''
+        self.motion_fault = ''
         self.command_sub = node.create_subscription(MobileCommand, '/robot/mobile/command',
                                                     self.mobile_command, COMMAND_QOS)
         self.services = [
@@ -576,7 +584,14 @@ class ChassisRos:
         self.watchdog = node.create_timer(.05, self.check_feedback)
         self.last_status = 0.
 
+    def session_fault(self):
+        if self.teleop_link is not None and (fault := self.teleop_link.status()) is not None:
+            return fault['reason']
+        return self.motion_fault
+
     def check_feedback(self):
+        if self.session_fault():
+            return
         c = self.control
         if c.enabled and (c.last_feedback is None or c.clock() - c.last_feedback >= FEEDBACK_LOSS_GRACE_S):
             detail = (f'；上一总线操作 {getattr(self.node, "last_transaction_kind", "无")} '
@@ -598,48 +613,77 @@ class ChassisRos:
         return received + (expires - now) / 1e9
 
     def mobile_command(self, message):
-        if self.teleop_fault:
-            return
         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+        if fault := self.session_fault():
+            self.publish_mobile_result(message, error=fault)
+            return
         if 0 < stamp <= self.latest_command_ns:
             return  # A prior command cannot undo a stop or supersede a newer target.
         try:
             deadline = self.valid_command(message)
             self.latest_command_ns = stamp
             if not self.control.enabled and not any(message.commands):
+                self.publish_mobile_result(message, error=self.control.fault or self.control.reason)
                 return
             self.control.set_mobile(message.commands, deadline=deadline)
         except (OSError, ValueError, RuntimeError) as exc:
-            self.pending_command = None
+            previous, self.pending_command = self.pending_command, None
             self.control.clear_target()
             self.control.reason = str(exc)
+            self.publish_mobile_result(message, error=self.control.reason)
+            if previous is not None:
+                self.publish_mobile_result(previous, error='A rejected newer command cleared the target')
             return
+        previous = self.pending_command
         self.pending_command = message if not self.control.homing else None
+        if previous is not None:
+            self.publish_mobile_result(previous, error='Mobile command superseded before velocity confirmation')
+        if self.control.homing:
+            self.publish_mobile_result(message, error='Lift homing is active')
+        elif not any(message.commands) and self.control.zero_targets_verified():
+            # `sent` contains readback-verified targets. Another zero needs
+            # neither a bus write nor another feedback tick to confirm it.
+            self.record_mobile_command()
 
     def record_mobile_command(self):
         """Acknowledge only after the shared controller has applied the command."""
         message, self.pending_command = self.pending_command, None
-        if (message is None or self.control.fault or self.control.feedback_paused
-                or self.control.clock() >= self.control.mobile_until):
+        if message is None:
+            return
+        if self.control.fault or self.control.feedback_paused:
+            self.publish_mobile_result(message, error=self.control.fault or self.control.reason)
+            return
+        if self.control.clock() >= self.control.mobile_until:
+            self.publish_mobile_result(message, error='Mobile command expired before velocity confirmation')
             return
         try:
             self.valid_command(message)
-            stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
-            event = {'kind': 'mobile', 'sequence': stamp, 'generated_ns': stamp, 'sent_ns': stamp,
-                     'accepted_ns': self.node.get_clock().now().nanoseconds,
-                     'targets': [int(value) for value in message.commands], 'session': self.node.group_session_id}
-            self.recording_command_publisher.publish(String(data=json.dumps(event, separators=(',', ':'), allow_nan=False)))
-        except Exception as exc:
-            self.node.get_logger().warning(f'Recording velocity event unavailable: {exc}',
-                                           throttle_duration_sec=1.)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.publish_mobile_result(message, error=str(exc))
+        else:
+            self.publish_mobile_result(message)
 
-    def on_teleop_fault(self, message):
-        if self.teleop_fault or not message.data:
+    def publish_mobile_result(self, message, *, error=None):
+        stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+        if stamp <= 0:
             return
-        self.teleop_fault = message.data
+        event = {'kind': 'mobile', 'sequence': stamp, 'generated_ns': stamp, 'sent_ns': stamp,
+                 'targets': [int(value) for value in message.commands], 'session': self.node.group_session_id,
+                 'accepted': error is None}
+        if error is None:
+            event['accepted_ns'] = self.node.get_clock().now().nanoseconds
+        else:
+            event['error'] = error
+        try:
+            self.recording_command_publisher.publish(String(data=json.dumps(event, separators=(',', ':'), allow_nan=False)))
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.node.get_logger().warning(f'Mobile command result unavailable: {exc}', throttle_duration_sec=1.)
+
+    def protective_stop(self, reason):
+        self.motion_fault = self.motion_fault or reason
         response = self.stop(None, Trigger.Response())
         if not response.success:
-            self.node.get_logger().error('遥操故障后零速度未确认：' + response.message)
+            raise RuntimeError(response.message)
 
     def enable(self, request, response):
         return self.service(self.control.enable, response)
@@ -651,8 +695,8 @@ class ChassisRos:
         return self.service(self.control.begin_home, response, invalidate_commands=True)
 
     def service(self, operation, response, *, invalidate_commands=False, allow_fault=False):
-        if self.teleop_fault and not allow_fault:
-            response.message = self.teleop_fault
+        if not allow_fault and (fault := self.session_fault()):
+            response.message = fault
             return response
         if invalidate_commands:
             self.pending_command = None
@@ -673,16 +717,17 @@ class ChassisRos:
         samples = {m.motor_id: {k: getattr(m, k) for k in (
             'position_ticks', 'velocity_raw', 'current_a', 'temperature_c', 'moving')}
             for m in message.motors if m.motor_id in AXIS_IDS and m.valid and not m.servo_error and not m.error}
-        previous_fault = self.control.fault
-        alarms = [m for m in message.motors if m.motor_id in AXIS_IDS and m.servo_error]
-        if self.control.enabled and alarms:
-            self.control.fail('; '.join(f'ID {m.motor_id} 舵机告警 0x{m.servo_error:02x}' for m in alarms))
-        detail = '; '.join(f'ID {m.motor_id}: {m.error}' for m in message.motors
-                           if m.motor_id in AXIS_IDS and m.motor_id not in samples and m.error)
-        self.control.observe(samples, missing_detail=detail)
-        self.record_mobile_command()
-        if self.control.fault and self.control.fault != previous_fault:
-            self.node.get_logger().error(self.control.reason)
+        if not self.session_fault():
+            previous_fault = self.control.fault
+            alarms = [m for m in message.motors if m.motor_id in AXIS_IDS and m.servo_error]
+            if self.control.enabled and alarms:
+                self.control.fail('; '.join(f'ID {m.motor_id} 舵机告警 0x{m.servo_error:02x}' for m in alarms))
+            detail = '; '.join(f'ID {m.motor_id}: {m.error}' for m in message.motors
+                               if m.motor_id in AXIS_IDS and m.motor_id not in samples and m.error)
+            self.control.observe(samples, missing_detail=detail)
+            self.record_mobile_command()
+            if self.control.fault and self.control.fault != previous_fault:
+                self.node.get_logger().error(self.control.reason)
         # The measured-state topic is an observation output, not part of the
         # motor safety loop.  A transient ROS publisher error must not tear
         # down the chassis owner and stop an otherwise healthy control path.
@@ -699,11 +744,13 @@ class ChassisRos:
             c = self.control
             speeds = [samples[i]['velocity_raw'] * math.tau / 4096 for i in (8, 9, 10) if i in samples]
             body = self.control.geometry.wheels_to_body(speeds) if len(speeds) == 3 else None
-            payload = {'enabled': c.enabled, 'fault': c.fault or self.teleop_fault, 'reason': c.reason,
-                       'enable_ready': not self.teleop_fault and c.stationary_status()[0],
+            payload = {'enabled': c.enabled, 'fault': c.fault or self.motion_fault, 'reason': c.reason,
+                       'motion_fault': self.motion_fault,
+                       'enable_ready': not self.motion_fault and c.stationary_status()[0],
                        'enable_wait_reason': c.stationary_status()[1],
                        'velocity_owned': sorted(c.driver.velocity_owned),
                        'feedback_paused': c.feedback_paused,
+                       'zero_targets_verified': not self.motion_fault and c.zero_targets_verified(),
                        'missing_motor_ids': list(c.missing_feedback_ids),
                        'homing': c.homing, 'height_m': c.height, 'base_measured': body,
                        'wheel_ticks_s': [samples[i]['velocity_raw'] if i in samples else None for i in (8, 9, 10)],
@@ -721,8 +768,8 @@ class ChassisRos:
         output.enabled = c.enabled
         output.homing = bool(c.homing)
         problems = []
-        if c.fault or self.teleop_fault:
-            problems.append(c.fault or self.teleop_fault)
+        if c.fault or self.motion_fault:
+            problems.append(c.fault or self.motion_fault)
         if c.feedback_paused:
             problems.append(c.reason or 'mobile feedback paused')
         missing = [motor_id for motor_id in AXIS_IDS if motor_id not in samples]
@@ -751,9 +798,9 @@ class ChassisRos:
         c = self.control
         samples = {m.motor_id: m for m in message.motors
                    if m.motor_id in AXIS_IDS and m.valid and not m.servo_error and not m.error}
-        if (not c.enabled or c.fault or self.teleop_fault or c.feedback_paused or c.homing
+        if (not c.enabled or c.fault or self.motion_fault or c.feedback_paused or c.homing
                 or c.height is None or len(samples) != 4):
-            return {'valid': False, 'reason': c.fault or self.teleop_fault or c.reason}
+            return {'valid': False, 'reason': c.fault or self.motion_fault or c.reason}
         measured = c.geometry.wheels_to_body([samples[i].velocity_raw * math.tau / 4096 for i in (8, 9, 10)])
         return {'valid': True, 'state': [c.height, *measured]}
 

@@ -10,9 +10,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from xyc_interfaces.msg import MobileCommand
 
-from xyc_hardware.chassis_control import (
-    CHASSIS_NOT_READY, COMMAND_QOS, TELEOP_FAULT_QOS, TELEOP_FAULT_TOPIC, mobile_message,
-)
+from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS, mobile_message
 from xyc.contracts import COMMAND_VALIDITY_S
 from xyc.transport.teleop import MAX_SAMPLE_AGE, checked_chassis
 
@@ -20,7 +18,8 @@ from xyc.transport.teleop import MAX_SAMPLE_AGE, checked_chassis
 class PCChassisBridge(Node):
     """Use the existing left-bus owner for base and lift commands."""
 
-    def __init__(self):
+    def __init__(self, *, link=None):
+        self.link = link
         self.packet_lock = threading.Lock()
         self.session = None
         self.packet = None
@@ -30,13 +29,12 @@ class PCChassisBridge(Node):
         self.last_received_operation = 0
         self.operation_deadline = 0.
         self.ack = None
-        self.teleop_fault = ''
+        self.motion_fault = ''
         self.stop_needed = False
         self._zero_sent = False
         super().__init__('pc_chassis_bridge', use_global_arguments=False)
         self.mobile_pub = self.create_publisher(MobileCommand, '/robot/mobile/command', COMMAND_QOS)
         self.status_sub = self.create_subscription(String, '/robot/chassis/status', self.on_status, 1)
-        self.fault_sub = self.create_subscription(String, TELEOP_FAULT_TOPIC, self.on_teleop_fault, TELEOP_FAULT_QOS)
         self.control_clients = {name: self.create_client(Trigger, '/robot/chassis/' + name)
                                 for name in ('enable', 'stop', 'home_lift')}
         self.pending = None
@@ -51,17 +49,14 @@ class PCChassisBridge(Node):
             state = json.loads(message.data)
             if not isinstance(state, dict):
                 return
-            self.state, self.received = state, time.monotonic()
         except (TypeError, ValueError):
             return
-
-    def on_teleop_fault(self, message):
         with self.packet_lock:
-            if self.teleop_fault or not message.data:
-                return
-            self.teleop_fault = message.data
-            self.packet = None
-            self.ack = None
+            self.state, self.received = state, time.monotonic()
+            if not self.motion_fault and state.get('motion_fault'):
+                self.motion_fault = state['motion_fault']
+                self.packet = None
+                self.ack = None
 
     def publish_velocity(self):
         stamp = self.get_clock().now().to_msg()
@@ -89,9 +84,9 @@ class PCChassisBridge(Node):
         with self.packet_lock:
             if session != self.session:
                 raise ValueError('底盘控制连接已变化')
-            if self.teleop_fault:
+            if self.motion_fault:
                 if operation is not None:
-                    self.ack = {'id': operation['id'], 'accepted': False, 'message': self.teleop_fault[:80]}
+                    self.ack = {'id': operation['id'], 'accepted': False, 'message': self.motion_fault[:80]}
                 return
             if operation is not None:
                 if operation['id'] < self.last_received_operation:
@@ -112,8 +107,8 @@ class PCChassisBridge(Node):
         with self.packet_lock:
             fresh = self.received is not None and time.monotonic() - self.received <= .5
             status = dict(self.state) if fresh else {}
-            if self.teleop_fault:
-                status['fault'] = self.teleop_fault
+            if self.motion_fault:
+                status['fault'] = self.motion_fault
             for field in ('fault', 'reason'):
                 if field in status:
                     status[field] = str(status[field])[:80]
@@ -121,9 +116,18 @@ class PCChassisBridge(Node):
             return {'chassis_status': status, 'chassis_ack': ack}
 
     def publish_commands(self):
+        if self.link is None:
+            self._publish_commands()
+        else:
+            try:
+                self.link.dispatch(self._publish_commands)
+            except ConnectionError:
+                pass  # After disconnect, the shared stop owns base and lift cleanup.
+
+    def _publish_commands(self):
         now = time.monotonic()
         with self.packet_lock:
-            if self.teleop_fault:
+            if self.motion_fault:
                 return  # The motor owner executes the same stop operation used by replay and policy.
             if self.operation is not None:
                 session, operation_id, name = self.operation

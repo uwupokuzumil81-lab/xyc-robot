@@ -241,11 +241,13 @@ def execute(plan, *, host='localhost', port=robot_profile().ports['motion'], hom
             if started and not finished:
                 try:
                     if not getattr(client, 'last_stop_confirmed', False):
-                        client.call('stop')
+                        client.call('fault' if summary['status'] == 'failed' else 'stop')
                     summary['stop_confirmed'] = True
                 except Exception as exc:
                     summary['stop_confirmed'] = False
-                    summary['stop_error'] = str(exc)
+                    summary['stop_error'] = getattr(exc, 'stop_error', '') or str(exc)
+                    if summary['stop_error'] not in summary.get('reason', ''):
+                        progress('停车未确认：' + summary['stop_error'])
             try:
                 client.close()
             except OSError as exc:

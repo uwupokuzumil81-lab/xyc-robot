@@ -21,15 +21,16 @@ from xyc_interfaces.msg import ArmState, MobileCommand
 
 from xyc_hardware.arm_group_coordinator import ArmGroupCoordinator
 from xyc.robot.calibration import denormalize_tick, normalize_tick
-from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS
+from xyc_hardware.chassis_control import CHASSIS_NOT_READY, COMMAND_QOS, COMMAND_RESULT_QOS
 from xyc_hardware.motion_replay import MotionReplay
 from xyc.contracts import ACTION_NAMES, ACTION_UNITS, STATE_NAMES, STATE_UNITS, physical_mobile_action
-from xyc.transport.motion import PROTOCOL, receive, send
+from xyc.transport.motion import MOTION_IDLE_S, PROTOCOL, receive, send
 from test_arm_group_coordinator import FakeBus
 
 
 class ReplayFakeBus(FakeBus):
     def __init__(self, side):
+        self.feedback_available = True
         super().__init__(side)
         self.control_publisher = self.create_publisher(String, f'/motors/{side}/recording_sample', qos_profile_sensor_data)
 
@@ -41,8 +42,8 @@ class ReplayFakeBus(FakeBus):
         msg.names = list(self.arm_transaction.group.names)
         msg.position_normalized = [normalize_tick(control.entry, self.motors[name].position)
                                    for name, control in self.arm_transaction.group.controls.items()]
-        msg.valid = [True] * 7
-        msg.complete = True
+        msg.valid = [self.feedback_available] * 7
+        msg.complete = self.feedback_available
         self.pub.publish(msg)
         valid = all(c.owned and not c.fault for c in self.arm_transaction.group.controls.values())
         self.control_publisher.publish(String(data=json.dumps({
@@ -66,7 +67,7 @@ class FakeChassis(Node):
         self.accepted = []
         self.lock = threading.Lock()
         self.status = self.create_publisher(String, '/robot/chassis/status', 1)
-        self.commands = self.create_publisher(String, '/robot/chassis/recording_command', COMMAND_QOS)
+        self.commands = self.create_publisher(String, '/robot/chassis/recording_command', COMMAND_RESULT_QOS)
         self.subs = [self.create_subscription(MobileCommand, '/robot/mobile/command', self.on_velocity, COMMAND_QOS)]
         self.chassis_services = [self.create_service(Trigger, '/robot/chassis/' + name, callback)
                          for name, callback in [('enable', self.enable), ('stop', self.stop), ('home_lift', self.home)]]
@@ -93,6 +94,11 @@ class FakeChassis(Node):
         response.success = True
         return response
 
+    def protective_stop(self, reason):
+        self.stops += 1
+        self.accepted.append([0., 0., 0., 0.])
+        self.fault = self.fault or reason
+
     def home(self, _, response):
         response.success = True
         return response
@@ -100,12 +106,13 @@ class FakeChassis(Node):
     def on_velocity(self, message):
         stamp = message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
         with self.lock:
-            if self.get_clock().now().nanoseconds >= message.expires_at.sec * 10**9 + message.expires_at.nanosec:
+            if (self.fault or self.get_clock().now().nanoseconds >=
+                    message.expires_at.sec * 10**9 + message.expires_at.nanosec):
                 return
             values = physical_mobile_action(message.commands)
             self.accepted.append(values)
             targets = [int(value) for value in message.commands]
-            self.commands.publish(String(data=json.dumps({'sequence': stamp, 'targets': targets})))
+            self.commands.publish(String(data=json.dumps({'sequence': stamp, 'targets': targets, 'accepted': True})))
 
 
 @unittest.skipUnless(os.environ.get('XYC_ISOLATED_TEST') == '1' and os.environ.get('ROS_DOMAIN_ID') == '183',
@@ -120,7 +127,28 @@ class TestReplayROS(unittest.TestCase):
     def test_policy_waits_for_post_hold_stationary_feedback(self):
         self.run_source('policy', wait_after_hold=True)
 
-    def run_source(self, source, wait_after_hold=False):
+    def test_replay_disconnect_stops_both_arms_even_with_missing_feedback(self):
+        self.run_source('replay', lose_arm_feedback=True)
+
+    def test_policy_disconnect_stops_both_arms_even_with_missing_feedback(self):
+        self.run_source('policy', lose_arm_feedback=True)
+
+    def test_replay_disconnect_cancels_inflight_goal_before_second_bus_and_base(self):
+        self.run_source('replay', failure='in-flight')
+
+    def test_policy_disconnect_cancels_inflight_goal_before_second_bus_and_base(self):
+        self.run_source('policy', failure='in-flight')
+
+    def test_replay_stall_expires_even_with_readonly_status_traffic(self):
+        self.run_source('replay', failure='stall')
+
+    def test_policy_stall_expires_even_with_readonly_status_traffic(self):
+        self.run_source('policy', failure='stall')
+
+    def test_policy_failed_torque_off_reports_exact_joint_after_reconnect(self):
+        self.run_source('policy', failure='stop-unconfirmed')
+
+    def run_source(self, source, wait_after_hold=False, lose_arm_feedback=False, failure='chassis'):
         rclpy.init()
         nodes, thread, executor, connection = [], None, None, None
         replay = None
@@ -130,6 +158,7 @@ class TestReplayROS(unittest.TestCase):
             elbow = left.arm_transaction.group.controls[elbow_name]
             left.motors[elbow_name].position = denormalize_tick(elbow.entry, 97.80018)
             chassis = FakeChassis()
+            left.chassis = chassis
             chassis.refuse_enable_once = wait_after_hold
             coordinator = ArmGroupCoordinator(parameter_overrides=[
                 Parameter('command_source', value=source)])
@@ -143,16 +172,21 @@ class TestReplayROS(unittest.TestCase):
             deadline = time.monotonic() + 5.
             while not replay.snapshot()['ready'] and time.monotonic() < deadline: time.sleep(.02)
             self.assertTrue(replay.snapshot()['ready'])
+            for client in replay.fault_request.clients.values():
+                self.assertTrue(client.wait_for_service(timeout_sec=2.))
             connection = socket.create_connection(('127.0.0.1', replay.port), timeout=3.)
             connection.settimeout(4.)
             channel = connection.makefile('rwb')
             sequence = 0
-            def call(operation, **values):
+            def request(operation, **values):
                 nonlocal sequence
                 if operation == 'target':
                     values.setdefault('valid_for_s', .25)
                 sequence += 1
                 send(channel, {'sequence': sequence, 'operation': operation, **values})
+
+            def call(operation, **values):
+                request(operation, **values)
                 response = receive(channel)
                 self.assertTrue(response['accepted'], response.get('message'))
                 return response['snapshot']
@@ -169,14 +203,14 @@ class TestReplayROS(unittest.TestCase):
             while not replay.snapshot()['chassis'].get('enabled') and time.monotonic() < deadline:
                 call('heartbeat')
                 time.sleep(.02)
-            action = [0.] * 6 + [50.] + [0.] * 6 + [50.] + [0., 1., 0., 0.]
+            action = [0.] * 6 + [50.] + [0.] * 6 + [50.] + [1., 1., 0., 0.]
             action[2] = 99.35838
             action[5] = 80.
             action[6] = 100.
             call('target', action=action)
             self.assertIn('stream_targets', left.operations)
             self.assertIn('stream_targets', right.operations)
-            self.assertIn([0., .15, 0., 0.], chassis.accepted)
+            self.assertIn([.015, .15, 0., 0.], chassis.accepted)
             self.assertIn(('goal', denormalize_tick(elbow.entry, 99.35838)), left.motors[elbow_name].writes)
             for name, target in (('arm_left_wrist_roll', 80.), ('arm_left_gripper', 100.)):
                 control = left.arm_transaction.group.controls[name]
@@ -185,28 +219,94 @@ class TestReplayROS(unittest.TestCase):
             while replay.snapshot()['driver_targets'][5:7] != [80., 100.] and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertEqual(replay.snapshot()['driver_targets'][5:7], [80., 100.])
-            # A chassis protection fault is reported with its actual snapshot;
-            # it must not be misreported as a calibration change or prevent
-            # freezing independently healthy arm feedback on disconnect.
-            chassis.fault = 'ID 11 持续过流：5.23 A'
-            deadline = time.monotonic() + 2.
-            while replay.snapshot()['ready'] and time.monotonic() < deadline: time.sleep(.01)
-            sequence += 1
-            send(channel, {'sequence': sequence, 'operation': 'heartbeat'})
-            rejected = receive(channel)
-            self.assertFalse(rejected['accepted'])
-            self.assertTrue(rejected['stop_confirmed'], rejected.get('stop_error'))
-            self.assertIn('ID 11', rejected['message'])
-            self.assertNotIn('calibration changed', rejected['message'])
-            self.assertEqual(rejected['snapshot']['chassis']['fault'], chassis.fault)
-            self.assertTrue(rejected['snapshot']['arms_ready'])
+            normal_stops = 0
+            failed_motor = None
+            if failure == 'in-flight':
+                inspect = right.arm_transaction.group.read_group_snapshot
+                in_preflight = threading.Event()
+                writes = {name: len(motor.writes) for name, motor in right.motors.items()}
+
+                def wait_for_stop():
+                    in_preflight.set()
+                    until = time.monotonic() + 1.
+                    while not right.reader.motion_fault and time.monotonic() < until:
+                        time.sleep(.002)
+                    return inspect()
+
+                right.arm_transaction.group.read_group_snapshot = wait_for_stop
+                action[7], action[15] = 30., -1.
+                request('target', action=action)
+                self.assertTrue(in_preflight.wait(1.))
+                connection.shutdown(socket.SHUT_RDWR)
+            elif failure == 'stall':
+                self.assertTrue(call('hold')['ready'])
+                normal_stops = 1
+                until = time.monotonic() + MOTION_IDLE_S + .08
+                while time.monotonic() < until:
+                    time.sleep(.06)
+                    self.assertTrue(call('status')['ready'])
+                call('target', action=action)
+                until = time.monotonic() + MOTION_IDLE_S + 1.
+                while True:
+                    self.assertLess(time.monotonic(), until)
+                    time.sleep(.06)
+                    request('status')
+                    rejected = receive(channel)
+                    if not rejected['accepted']:
+                        break
+                self.assertTrue(rejected['stop_confirmed'], rejected['stop_error'])
+                self.assertIn('loop timed out', rejected['message'])
+            else:
+                if failure == 'stop-unconfirmed':
+                    failed_motor = right.motors['arm_right_shoulder_pan']
+                    failed_motor.fail_release = True
+                if lose_arm_feedback:
+                    left.feedback_available = False
+                else:
+                    chassis.fault = 'ID 11 持续过流：5.23 A'
+                deadline = time.monotonic() + 2.
+                while replay.snapshot()['ready'] and time.monotonic() < deadline: time.sleep(.01)
+                self.assertFalse(replay.snapshot()['ready'])
+            if lose_arm_feedback:
+                self.assertFalse(replay.snapshot()['arms_ready'])
+            elif failure in ('chassis', 'stop-unconfirmed'):
+                request('heartbeat')
+                rejected = receive(channel)
+                self.assertFalse(rejected['accepted'])
+                self.assertEqual(rejected['stop_confirmed'], failed_motor is None)
+                if failed_motor is not None:
+                    self.assertIn('arm_right_shoulder_pan', rejected['stop_error'])
+                self.assertIn('ID 11', rejected['message'])
+                self.assertNotIn('calibration changed', rejected['message'])
             channel.close()
             connection.close()
             connection = None
             deadline = time.monotonic() + 3.
-            while chassis.stops < 1 and time.monotonic() < deadline: time.sleep(.02)
-            self.assertGreaterEqual(chassis.stops, 1)
-            self.assertEqual(replay.last_mobile, [0., 0., 0., 0.])
+            while replay.connection is not None and time.monotonic() < deadline: time.sleep(.02)
+            self.assertIsNone(replay.connection)
+            self.assertEqual(chassis.stops, 1 + normal_stops)
+            self.assertEqual(chassis.accepted[-1], [0., 0., 0., 0.])
+            self.assertIsNone(replay.last_mobile)
+            self.assertTrue(replay.motion_fault)
+            for bus in (left, right):
+                self.assertEqual(bus.stop_confirmed, failed_motor not in bus.motors.values())
+                self.assertEqual(bus.arm_transaction.group.state, 'fault')
+                self.assertTrue(all(motor.torque == 0 and motor.writes[-1] == ('torque', False)
+                                    for motor in bus.motors.values() if motor is not failed_motor))
+            if failure == 'in-flight':
+                self.assertNotIn([.015, -.15, 0., 0.], chassis.accepted)
+                for name, motor in right.motors.items():
+                    self.assertEqual(motor.writes[writes[name]:], [('torque', False)])
+            if failed_motor is not None:
+                self.assertEqual(failed_motor.torque, 1)
+                with socket.create_connection(('127.0.0.1', replay.port), timeout=1.) as probe:
+                    with probe.makefile('rwb') as probe_channel:
+                        send(probe_channel, {'sequence': 1, 'operation': 'status'})
+                        observed = receive(probe_channel)['snapshot']
+                        self.assertFalse(observed['stop_confirmed'])
+                        self.assertIn('arm_right_shoulder_pan', observed['stop_error'])
+            left.feedback_available = True
+            self.assertFalse(replay.snapshot()['ready'])
         finally:
             if connection is not None: connection.close()
             if replay is not None: replay.close()
@@ -236,20 +336,23 @@ class TestMobileEnableWait(unittest.TestCase):
 class TestTargetDeadline(unittest.TestCase):
     """Use the production backend methods without creating ROS nodes or motors."""
 
-    def make_node(self, *, arm_delay=0., snapshot_delay=0., acceptance_delay=0.):
+    def make_node(self, *, arm_delay=0., snapshot_delay=0., acceptance_delay=0., zero_verified=False):
         clock = [10.]
         generated = SimpleNamespace(sec=100, nanosec=0)
-        node = SimpleNamespace(closing=threading.Event(), accepted_mobile={}, last_mobile=[0.] * 4)
+        node = SimpleNamespace(closing=threading.Event(), mobile_results={}, last_mobile=[0.] * 4)
+        node.lock = threading.RLock()
+        node.require_active_link = lambda: None
         node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: generated))
         def snapshot():
             clock[0] += snapshot_delay
-            return {'ready': True, 'state': [0.] * 18, 'chassis': {'enabled': True}}
+            return {'ready': True, 'state': [0.] * 18,
+                    'chassis': {'enabled': True, 'zero_targets_verified': zero_verified}}
         node.snapshot = snapshot
         def arms(*args, **kwargs): clock[0] += arm_delay
         node._set_arms = Mock(side_effect=arms)
         def publish(values, **kwargs):
             if not acceptance_delay:
-                node.accepted_mobile[1] = {'targets': list(values)}
+                node.mobile_results[1] = {'targets': list(values), 'accepted': True}
             return 1
         node._publish_mobile = Mock(side_effect=publish)
         class Condition:
@@ -257,7 +360,7 @@ class TestTargetDeadline(unittest.TestCase):
             def __exit__(self, *args): pass
             def wait(self, timeout):
                 clock[0] += acceptance_delay
-                node.accepted_mobile[1] = {'targets': [1, 1, 0, 0]}
+                node.mobile_results[1] = {'targets': [1, 1, 0, 0], 'accepted': True}
         node.condition = Condition()
         return node, clock, generated
 
@@ -292,7 +395,51 @@ class TestTargetDeadline(unittest.TestCase):
         with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
             with self.assertRaisesRegex(TimeoutError, 'before base/lift confirmation'):
                 MotionReplay.target(node, [0.] * 14 + [1., 1., 0., 0.], ['l', 'r'], valid_for_s=.25)
+        self.assertIsNone(node.last_mobile)
+
+    def test_verified_repeated_zero_skips_the_mobile_round_trip(self):
+        node, clock, _ = self.make_node(zero_verified=True)
+        node.last_mobile = None
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            for _ in range(2):
+                MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        self.assertEqual(node._set_arms.call_count, 2)
+        node._publish_mobile.assert_called_once()
         self.assertEqual(node.last_mobile, [0.] * 4)
+
+    def test_repeated_zero_with_unknown_driver_state_still_requires_confirmation(self):
+        node, clock, _ = self.make_node(zero_verified=False)
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        node._publish_mobile.assert_called_once()
+
+    def test_zero_after_nonzero_does_not_reuse_an_older_zero_status(self):
+        node, clock, _ = self.make_node(zero_verified=True)
+        node.last_mobile = [0., 1., 0., 0.]
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        node._publish_mobile.assert_called_once()
+        self.assertEqual(node.last_mobile, [0.] * 4)
+
+    def test_feedback_lost_during_arm_write_cannot_reuse_the_zero_result(self):
+        node, clock, _ = self.make_node(zero_verified=True)
+        node.snapshot = Mock(side_effect=[node.snapshot(),
+                                          {'ready': False, 'reason': 'base feedback paused'}])
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(RuntimeError, 'base feedback paused'):
+                MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        node._publish_mobile.assert_not_called()
+
+    def test_explicit_mobile_rejection_reports_the_driver_reason(self):
+        node, clock, _ = self.make_node()
+        node._publish_mobile.side_effect = None
+        node._publish_mobile.return_value = 1
+        node.mobile_results[1] = {'targets': [0, 0, 0, 0], 'accepted': False,
+                                  'error': 'Mobile command expired in the ROS queue'}
+        with patch('xyc_hardware.motion_replay.time.monotonic', lambda: clock[0]):
+            with self.assertRaisesRegex(RuntimeError, 'expired in the ROS queue'):
+                MotionReplay.target(node, [0.] * 18, ['l', 'r'], valid_for_s=.25)
+        self.assertEqual(node.mobile_results, {})
 
     def test_service_wait_cannot_dispatch_a_request_after_its_deadline(self):
         node, clock, _ = self.make_node()

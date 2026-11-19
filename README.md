@@ -2,7 +2,7 @@
 
 一个连接双臂、四路相机、底盘和升降机构的机器人平台。电脑负责主臂读取、键盘、数据保存和模型运行，树莓派负责 ROS 2 Jazzy 与实机驱动。支持 Windows / Linux 电脑，训练可移到云 GPU。
 
-遥操、数据回放和模型推理共用双臂协调器、电机节点、速度参数与保护逻辑。当前已接入 ACT；Π0.5 模型本体尚未接入。
+遥操、数据回放和模型推理共用双臂协调器、电机节点、速度参数与故障停车。ACT 和 π0.5 都已接入统一的训练和推理框架。
 
 ## 代码结构
 
@@ -25,6 +25,7 @@ src/xyc/
   recording/               回合缓存、传输和 LeRobot v3 保存
   learning/                数据读取、模型注册、训练、checkpoint和入口
   models/act/              ACT 模型、配置和适配器
+  models/pi05/             π0.5 模型源码、预处理、RTC 引导和适配器
   runtime/                 推理调度、人工准备、执行与评估记录
   images.py                原始 RGB 解码和显式图像变换工具
   assets.py                标定版本计算
@@ -40,6 +41,7 @@ config/
   calibration/            从臂标定资产
   leader_calibration/     主臂标定资产
   train/act.yaml           ACT 训练配置
+  train/pi05.yaml          π0.5 全参微调配置
 tools/                     三个薄脚本入口，共用已安装的实现
 ```
 
@@ -118,7 +120,7 @@ python tools/teleop_stream.py leader --side both --keyboard --record --record-sc
 
 大小写均可。Windows 使用按键按下/松开状态；Linux 终端使用按键重复，停止重复后约 0.25 秒停车。
 新的换向或停车按键优先于长按续发；松开当前方向键后该轴停车。遥操和模型推理前的人工准备界面使用同一键盘状态机与主臂采样器。
-遥操报停时，电机节点调用公共停车逻辑。底盘和升降写入零速并取消回零，双臂关闭已上力关节的扭矩，停止追踪上一目标。故障锁定拒绝新的运动和使能请求，重新连接电脑不会清除锁定。排除故障后重启遥操后端。
+遥操报停或主臂断连、回放或推理断连或控制循环超时，都会请求左右电机节点执行保护停车。实机遥操由同一后端运行两侧电机节点，断连后丢弃尚未写入串口的目标。按 Q 请求一次统一保护停车，之后电脑只等待停车确认。底盘和升降写入零速并取消回零，双臂释放已上力关节的扭矩。电机节点先锁住运动和使能请求，再分别核对停车结果。遥操电脑端会显示停车未确认的关节及原因。连接已断开时，可在后端重启前重新连接查看。排除故障后重启后端。
 
 客户端自动建立独立数据 SSH 通道并打开四路相机网页。浏览器只显示图像；控制时将焦点切回终端。
 相机 `fps`、`jpeg_quality` 决定采集和推理输入，网页显示频率单独由配置的 `preview_fps` 控制；调低网页频率不会降低采集流频率。
@@ -147,7 +149,7 @@ python tools/teleop_stream.py leader --side both --keyboard --record --record-sc
 
 ## 模型与回放
 
-完整命令见 [docs/learning.md](docs/learning.md)。
+ACT 和 π0.5 的模型源码都在本仓库，共用训练、checkpoint、离线推理和实机部署入口。完整安装与命令见 [docs/learning.md](docs/learning.md)。
 
 ```bash
 python tools/learning.py train --config config/train/act.yaml
@@ -155,7 +157,7 @@ python tools/learning.py infer --checkpoint 权重目录 --dataset 数据集目�
 python tools/learning.py deploy --checkpoint 权重目录 --device cuda --prepare-mode keyboard
 ```
 
-推理先进入人工准备界面，调整后按 P 开始；`--prepare-mode teleop` 使用主臂加键盘，否则只用键盘调整底盘/升降。P 暂停，Y/N 标成功或失败并返回准备，Q 退出。
+推理先进入人工准备界面，调整后按 P 开始。`--prepare-mode teleop` 使用主臂加键盘，默认模式用键盘调整底盘和升降。P 暂停后按 R 恢复，Y/N 标成功或失败并返回准备，Q 退出。获取 TCP 发送锁后再检查按键，按下 P 时尚未发送的模型动作会被丢弃。正常暂停时双臂原位保持，底盘和升降停车。
 
 实机回放需要先退出遥操后端，再运行 `replay.launch.py` 并转发17886，然后在电脑执行：
 
@@ -168,7 +170,7 @@ python tools/learning.py replay --dataset 数据集目录 --episode 0 --speed 1 
 ## 控制与维护
 
 启动上力先读取当前位置并确认，再保持当前位置；持续目标每条总线批量写入。正常到位继续上力，位置偏移报警时保留目标。夹爪接触采用限扭矩夹持。电流、温度、反馈中断、通信结果不明和退出时的处理共用同一套底层实现。
-底盘和升降共用 `/robot/mobile/command`，三值目标和绝对执行期限一次发送；旧的两个速度话题入口已移除。源码更新后需同步并重新构建机器人端的 `xyc_interfaces` 与后端，控制协议为 v3。
+底盘和升降共用 `/robot/mobile/command`，每条三值目标都带绝对执行期限。回放和推理使用 v5 控制协议，机器人端需使用同版本并重新构建 `xyc_interfaces` 与后端。
 电脑客户端退出后，双臂可能继续保持；电机后端关闭会尝试脱力。重启后端前先支撑好双臂。
 
 ```bash

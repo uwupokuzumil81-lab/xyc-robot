@@ -1,0 +1,23 @@
+{
+  "upstream": "huggingface/lerobot",
+  "version": "v0.5.1",
+  "license": "Apache-2.0",
+  "source_base": "https://github.com/huggingface/lerobot/blob/v0.5.1/",
+  "upstream_sha256": {
+    "src/lerobot/policies/pi05/modeling_pi05.py": "56016f6d840871b46f261990ff5decfdf4cd6759dbc5cb2a4a150bf3ccfb68a2",
+    "src/lerobot/policies/pi_gemma.py": "fe287aa89ad2c826093306a89b6752ec00d19eea52a5f2b4b4d463246e294722",
+    "src/lerobot/policies/pi05/configuration_pi05.py": "c66dfddc27557dd89a1cabd1354f041923bfcb541d348185a9a1af7fab643a8b",
+    "src/lerobot/policies/pi05/processor_pi05.py": "267df9c34ebf78f45bcef61242a3f48a0edaf813e99b31ba4292c3c3cfe4301f",
+    "src/lerobot/processor/normalize_processor.py": "faedf40f64e1fcc6aeb287ff757abe6e85983560d82fcde060252d8f75e277d6",
+    "src/lerobot/processor/tokenizer_processor.py": "597fddb877b7df17f53a1dde48ad1e186600c350e55321a7b48d55d85225af91",
+    "src/lerobot/policies/rtc/modeling_rtc.py": "9de19b2548daf2233dfba8f8a74e06b98659598d50d2c54c002df359bb8e61a5",
+    "src/lerobot/policies/rtc/configuration_rtc.py": "a292ce9b9afef4e06bb978554d250357af65d25742cfa848370f0ef3b5c1fe48"
+  },
+  "changes": [
+    "Use local XYC schema and model configuration with the published architecture and weight names.",
+    "Keep the upstream SigLIP, PaliGemma, PiGemma, and flow-matching computation; use the platform loader and episode padding mask.",
+    "Adapt quantile normalization, image resizing, and prompt/tokenizer steps to XYC batches.",
+    "Keep the upstream linear-prefix RTC guidance. Use XYC runtime for queue ownership and scheduling.",
+    "Remove upstream rollout, Hub serialization, debug tracking, and configuration and processor registries."
+  ]
+}

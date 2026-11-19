@@ -1,4 +1,4 @@
-# ACT：训练、保存与推理
+# ACT 和 π0.5 的训练、保存与推理
 
 当前已完成模型侧的闭环：现有 LeRobot v3 数据 → 四路图像与18维状态 → ACT训练 → 平台checkpoint → 重载 → 50×18动作预测。
 正式长训练尚未启动；测试权重仅验证计算流程。`learning.py deploy` 已通过公共运行时和回放控制后端接到同一套18维实机控制，
@@ -27,7 +27,7 @@
 `statistics_spec(model_config, schema)`，按其声明准备数据与统计量；图像常量也由适配器声明，公共数据层不再写死ImageNet参数。
 `SampleSpec`支持当前帧、state/图像历史帧、任意动作偏移和`include_task`；窗口越过回合边界时返回填充标记，不跨回合取数据。
 `StatisticsSpec`支持mean/std、min/max、q01/q99及模型声明的常量。文本按每帧task_index解析；分词和特殊编码属于模型适配器。
-checkpoint记录采样声明、统计声明和实际统计量。公共读取器保留原始RGB分辨率，ACT在同一个prepare路径处理训练和实时图像；网络输入形状和归一化数值保持一致，Π0.5模型本体仍待接入。
+checkpoint记录采样声明、统计声明和训练集统计量。公共读取器保留原始RGB分辨率。ACT 和 π0.5 各自用同一个 prepare 路径处理训练、离线推理和实时图像。
 
 运行时已拆成三层：
 
@@ -35,22 +35,66 @@ checkpoint记录采样声明、统计声明和实际统计量。公共读取器�
 PolicyRunner                 调模型并记录预测，交给选定的推理策略
   └─ strategies/
        ├─ sync_chunk.py      普通动作块队列；ACT可选时间集成
-       └─ rtc.py             RTC统一接口，只接受真正提供RTC后端的模型
+       └─ rtc.py             后台预测、动作接续、过期检查，用于提供RTC推理的模型
 PolicyExecutor               把选中的18维动作映射成统一机器人命令并交给CommandSink
 ```
 
-RTC不是对所有动作块都能套用的通用平滑函数。公共层只统一调度、动作选择和执行接口；
-Π0.5的引导去噪、上一动作块条件、推理延迟和execution horizon属于模型专用实现，
-以后放在`models/pi05/`并通过`create_rtc_runtime()`接入。当前ACT没有该能力，显式选择`rtc`
-会被拒绝，不会把普通异步队列冒充RTC。`PolicyExecutor`也不包含串口、ROS或安全阈值；
-这些仍由一个平台命令接收端转交现有统一控制器。
+RTC 的公共调度层运行单个后台预测任务，在旧块尚有动作时提交下一次预测。切换时按实际已发送的动作步数
+跳过新块的重叠前缀。新块返回时，如果接续位置已经越过引导区间，就丢弃这次预测。旧块还有有效动作时继续执行，并按实测延迟重新预测。π0.5 适配器用归一化动作做模型内的 RTC 引导去噪，并返回反归一化后的机器人动作。
+ACT 使用 `sync_chunk`。两种策略都把单步动作交给 `PolicyExecutor` 和现有的机器人控制后端。
 
 普通动作块策略通过`chunk_execution_spec()`读取执行步数、预测时域和是否集成；
 需要集成时只调用适配器的`ensemble_action(chunk)`。公共运行时不再访问ACT内部的`policy.temporal_ensembler`。
 
 ACT源码固定自 LeRobot v0.4.3；`models/act/PROVENANCE.json` 保存上游地址、原文件哈希和修改说明。
 修改仅是本地配置、常量和基类依赖接线；网络、VAE和损失计算保留该版本实现。Apache-2.0许可证随模型保存。
-运行时模型不导入 `lerobot`，公共训练器也不使用其配置类或处理器工厂。
+π0.5 源码固定自 LeRobot v0.5.1。模型、预处理和 RTC 引导都放在 `models/pi05/`，
+上游文件哈希和改动记录在 `PROVENANCE.json`，并附有 Apache-2.0 许可证。
+ACT 和 π0.5 的运行环境都无需安装 LeRobot 包。π0.5 使用 PyTorch 和 Transformers，基座与 tokenizer 作为独立资产加载。
+
+## π0.5 训练与推理
+
+π0.5 直接读取同一份 LeRobot v3 数据集。四路 RGB 按 `forward, chest, wrist_left, wrist_right` 进入模型。
+本地 π0.5 处理器把每帧任务文字和归一化后的 18 维 state 组装并分词。状态和关节动作使用训练集分位数，分位数重合时使用观测范围。
+升降和底盘动作固定以 `[-1, 1]` 归一化，保留原有三值标签。动作专家内部宽度为 32，输出为 `50 × 18`，
+回合末尾补帧及第 19–32 列不参与损失。执行阶段的关节限位、底盘三值映射及升降保护由公共运行时和控制器处理。
+
+在 GPU 电脑上使用 Python 3.12 的独立环境。
+在 Hugging Face 上接受 [PaliGemma tokenizer](https://huggingface.co/google/paligemma-3b-pt-224) 的访问条件，然后登录。训练和重载权重均使用此 tokenizer 的本机缓存。
+
+```bash
+source ~/miniforge3/etc/profile.d/conda.sh
+conda create -n xyc-pi05 python=3.12 pip -y
+conda activate xyc-pi05
+cd ~/Projects/blue_block_to_brown_bowl
+python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -e 'code[pi05]'
+hf auth login
+
+python code/tools/learning.py train --config code/config/train/pi05.yaml \
+  --dataset "$PWD/datasets/xyc/blue_block_to_brown_bowl_v1" \
+  --output "$PWD/weights/pi05/run_001"
+```
+
+默认从 [LeRobot 的 π0.5 基座](https://huggingface.co/lerobot/pi05_base) 加载 PyTorch 权重，微调视觉编码器、VLM 和动作专家。
+第一次加载需下载约 14.5 GB。训练参数在 `config/train/pi05.yaml`。这个配置以 batch 1、10000 步为起点，正式续训使用公共 `--resume`。
+全参训练需要显存明显高于本机 8 GB。基座损坏、权重缺失或者张量形状不匹配时训练会报错。
+π0.5 验证使用独立生成的固定去噪初始噪声。同一组验证样本的分数可用于比较各次 checkpoint，验证过程不推进训练随机数。
+
+```bash
+python code/tools/learning.py infer --checkpoint "$PWD/weights/pi05/run_001" \
+  --dataset "$PWD/datasets/xyc/blue_block_to_brown_bowl_v1" \
+  --episode 0 --device cuda --output /tmp/xyc-pi05-prediction.json
+
+python code/tools/learning.py deploy --checkpoint "$PWD/weights/pi05/run_001" \
+  --device cuda --prepare-mode keyboard --strategy rtc \
+  --task "Pick up the blue rectangular block and place it into the brown bowl."
+```
+
+实机推理按下文的统一控制通道启动 ROS 后端。按 P 后先在保持姿态下等待首块。连续运行时，`n_action_steps`
+是 RTC 的常规重规划间隔，默认 10 个控制步。剩余动作不足以覆盖估计延迟时会提前重规划。
+后台预测报错、旧块耗尽且新块未就绪，或动作块超出自身预测时域时，走现有安全停车。每条命令
+仍校验新鲜反馈和 250 ms 的有效期。RTC 使用现有 π0.5 checkpoint 的推理时引导，可用 `--strategy sync_chunk` 选择同步方式。
 
 ## 安装和启动
 
@@ -87,9 +131,10 @@ YAML中的相对路径按项目根目录解释；命令行覆盖的相对路径�
 
 ```bash
 python tools/learning.py smoke --output outputs/act_smoke_02
+python tools/learning.py smoke --config config/train/pi05.yaml --dataset /path/to/dataset --output outputs/pi05_smoke_01
 ```
 
-`smoke` 会缩小网络、图像和chunk，训练2步，再从权重重新加载预测。不能把这份配置当作完整ACT训练结果。
+`smoke` 默认在 CPU 上用缩小的网络、图像和动作块训练两步，然后回读权重做一次预测。π0.5 短训使用本地测试分词器和随机初始化的小模型，可离线验证流程。正式训练使用生产架构和对应的分词器。
 输出目录已存在时拒绝覆盖；换新目录，或者对正式训练显式使用续训。
 
 ## 训练设置
@@ -264,12 +309,14 @@ ssh -L 17883:127.0.0.1:17883 -L 17886:127.0.0.1:17886 pi5@树莓派地址
 python tools/learning.py deploy --checkpoint outputs/train/act_toys --device cuda --record-video
 ```
 
-准备阶段不调用模型，有两种输入方式：`--prepare-mode teleop`使用本机两只已标定主臂控制双臂，
-`--prepare-mode keyboard`不打开任何主臂串口，双臂保持当前位置。这两种都用键盘控制底盘与升降。
+准备阶段有两种输入方式。`--prepare-mode teleop` 使用本机两只已标定的主臂，对齐后自动接通双臂跟随。
+`--prepare-mode keyboard` 只用键盘调底盘与升降，双臂保持当前位置。首次准备时两种模式都可以用键盘移动底盘与升降。
 先按H完成缺失的升降回零，再用I/K调整高度、W/S前后、A/D平移、J/L旋转，空格停车。
-遥操准备复用采集入口的主臂读取、坏帧处理、标定换算及原有absolute跟随映射；不再保留另一套实现。
-确认姿态和场景后按P，模型才开始接管18维动作；再次按P暂停，原位保持并返回准备界面。
-每轮按P后先用当前观测预热模型，预热预测不下发；清空动作队列并读取新观测后才正式执行。
+遥操准备复用采集入口的主臂读取、坏帧处理、标定换算和绝对跟随映射。
+按 P 开始推理。推理中按 P 后，机器人保持双臂当前位置并停车，模型动作队列清空。获取 TCP 发送锁后再次读键，丢弃暂停时尚未发送的模型动作。
+遥操模式会显示主臂待调整的关节差值。连续三帧满足每个关节误差不超过 2 个标定单位、夹爪不超过 1 个单位时，
+自动开始绝对跟随。从模型切到等待对齐时，底盘和升降保持停车。按 P 暂停后，等待对齐或已经接管时都可以按 R 恢复推理。Y/N 标注后按 P 开始下一轮。
+同步模式每轮先做一次不下发动作的预热。RTC 在保持姿态时后台计算首块，新一轮只接收本轮启动的预测。
 推理中Y标记本轮成功、N标记失败并返回准备；未标记不计为成功。Q退出评估。
 切换时不重启驱动、不重新回零、不会自动升到某个任务高度。双臂保持上力，准备和模型使用同一个PolicyExecutor和机器人控制通道。
 这是所有模型共用的准备流程，不是ACT内部逻辑。键盘字母大小写均可，Linux和Windows控制台共用入口。
@@ -418,11 +465,8 @@ python "$env:USERPROFILE\Desktop\实习准备\pi05_from_zero\tools\learning.py" 
 每次target用新的序号和树莓派当前时间，不重放旧网络序号/过期时间戳。
 两条手臂总线批量提交，随后提交4轴速度并等待驱动接受事件；不宣称18轴硬件原子下发。
 任一目标被拒绝、回执不明或持续跟不上时停止，不跳过数据帧追赶，也不盲目重发结果不明的命令。
-数据间隔中有心跳续租速度指令；连接断开后，后端尝试发零速度，并让双臂保持当前测得位置。
-底层速度驱动也有命令超时保护；网络/程序停止不能代替现场断电。
-电脑另外每80ms在独立线程中只读查询status，保持TCP连接；它不发送target，也不续租速度指令。
-所有请求共用互斥的发送/接收通道，保活不会抢走动作回执。这样回零结束后的准备、打印等短暂停顿不会误触发350ms连接空闲超时，
-而主控制循环停顿时，底盘/升降仍保留原来的运动命令超时停车机制。通信中断转为明确错误，不自动重连、重发动作。
+数据间隔中由控制循环发心跳维持指令。电脑另有每 80 ms 的只读状态查询，用于保持 TCP 连接。只读查询不延长运动期限。运动过程中超过 0.5 秒没有新目标或控制心跳，后端触发保护停车。原位保持确认后有 5 秒等待窗口，用于首次准备和同步模型预热。RTC 等待首块时由运行循环发送心跳。
+后端在等待 ROS 回执期间也会检查 TCP 断连。发现断连后，取消尚未发出的目标并向两条总线请求保护停车。电机节点先锁存故障，再清理串口上的运动状态。通信失败时保留诊断信息。
 
 执行日志在电脑 `outputs/replay/<运行编号>/`，可用`--output`指定新的目录：
 
@@ -431,13 +475,13 @@ python "$env:USERPROFILE\Desktop\实习准备\pi05_from_zero\tools\learning.py" 
 失败时另存failure记录及meta.json中的failure_snapshot；后端拒绝回执附带当时反馈和故障原因。
 标定变化与反馈/底层保护停止分别报告，升降持续过流会显示具体ID、电流和阈值，不再统称为标定变化。
 后端拒绝一次已启动的请求时，先执行停止清理，再随拒绝回执返回stop_confirmed及stop_error。
-电脑保留这个确认结果，避免清理已成功却因后续连接关闭被误报为停止未确认。
+电脑显示并记录停车确认状态及具体失败原因。连接已断时，后端保留诊断，之后可通过只读状态查看。
 
 反馈快照包含其来源接收时间；目标被接受不等于每个采样点已物理到位。
 反馈快照新增driver_targets、driver_target_ticks和driver_target_stamps_ns：
 它们来自最新底层状态样本，记录最后已写入并回读确认的目标；可能比当前RPC回执晚一个采样周期，
 应结合样本时间比较。它们与action请求以及state实测位置分别保存，不再只根据accepted判断目标值是否一致。
-日志写入失败会停止动作回放。Ctrl+C中断电脑客户端会尝试停车并冻结双臂当前目标；停车未确认时日志保留stop_confirmed=false。
+日志写入失败或活动中的网络连接断开时，遥操、回放和推理共用电机保护停车入口。底盘和升降写零速，双臂释放扭矩，故障会话锁定。正常 Ctrl+C 会尝试停车并保持双臂当前位置。停车未确认时，回放日志保留 `stop_confirmed=false`。
 不要在回放中手动移动机械臂，正式运行前需在现场完成验证。
 
 自动验证包括PC协议/流程测试及树莓派隔离ROS测试（使用假总线和假底盘）。
@@ -445,7 +489,7 @@ python "$env:USERPROFILE\Desktop\实习准备\pi05_from_zero\tools\learning.py" 
 新版需同步到树莓派并重新构建后再做实机验收。
 
 执行期限由公共 `PolicyExecutor` 检查。一次实时观测、预处理和预测若超过 0.25 秒，
-预测结果不会下发；剩余有效期随 v3 控制协议传到树莓派。底盘/升降经单个 `MobileCommand` 携带相同绝对期限，接收端、周期执行和串口写入前均检查，不会因ROS排队而获得新的有效期。升级后需同步并重新编译 `xyc_interfaces` 与后端，
+预测结果不会下发。剩余有效期随 v5 控制协议传到树莓派。底盘和升降经单个 `MobileCommand` 携带相同绝对期限，接收端、周期执行和串口写入前均检查。升级后需同步并重新编译 `xyc_interfaces` 与后端，
 协议版本不匹配时会在准备阶段拒绝控制，不采用旧目标重试。
 
 动作最后四维始终是 `-1/0/+1`，状态保留实际物理单位。各轴名义速度从公共契约读取；

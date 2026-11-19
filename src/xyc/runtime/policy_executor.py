@@ -24,9 +24,12 @@ class CommandResult:
 class CommandSink(Protocol):
     """ROS, replay transport or another frontend can implement this contract."""
 
-    def dispatch(self, command: dict, *, sequence: int, valid_for_s: float) -> CommandResult: ...
+    def dispatch(self, command: dict, *, sequence: int, valid_for_s: float,
+                 before_send=None) -> CommandResult | None: ...
 
     def stop(self): ...
+
+    def fault_stop(self): ...
 
 
 class PolicyExecutor:
@@ -42,16 +45,17 @@ class PolicyExecutor:
         self.command_sink = command_sink
         self.sequence = 0
 
-    def reset(self):
-        self.runner.reset()
-        self.sequence = 0
-
-    def step(self, batch, *, observation=None, video_frames=None, deadline=None):
+    def step(self, batch, *, observation=None, video_frames=None, deadline=None, allow_dispatch=None):
         action = self.runner.step(batch, observation=observation, video_frames=video_frames)
+        if action is None:
+            return None
+        action_deadline = self.runner.action_deadline
+        if action_deadline is not None:
+            deadline = action_deadline if deadline is None else min(deadline, action_deadline)
         values = action[0].detach().cpu().tolist()
-        return self.execute_action(values, deadline=deadline, observation=observation)
+        return self.execute_action(values, deadline=deadline, observation=observation, before_send=allow_dispatch)
 
-    def execute_action(self, values, *, record=True, deadline=None, observation=None):
+    def execute_action(self, values, *, record=True, deadline=None, observation=None, before_send=None):
         """Manual preparation and model execution share one command path.
 
         Regression outputs are projected onto the full calibrated position
@@ -72,24 +76,21 @@ class PolicyExecutor:
                 self.runner.record_execution(
                     sent_action=None, accepted=False, command_id=str(self.sequence),
                     message='Inference deadline expired before dispatch; no action was sent')
-            try:
-                self.command_sink.stop()
-            except BaseException:
-                pass
             raise TimeoutError('Inference deadline expired before dispatch; no action was sent')
         try:
             result = self.command_sink.dispatch(
-                command, sequence=self.sequence, valid_for_s=validity)
+                command, sequence=self.sequence, valid_for_s=validity, before_send=before_send)
         except BaseException as exc:
             if record:
                 self.runner.record_execution(
                     sent_action=submitted, accepted=None, command_id=str(self.sequence),
                     message=f'{type(exc).__name__}: {exc}')
-            try:
-                self.command_sink.stop()
-            except BaseException:
-                pass
             raise
+        if result is None:
+            if record:
+                self.runner.record_execution(sent_action=None, accepted=False, command_id=str(self.sequence),
+                                             message='Model action cancelled before TCP send')
+            return None
         if not isinstance(result, CommandResult):
             raise TypeError('Command sink must return CommandResult')
         if record:
@@ -103,11 +104,11 @@ class PolicyExecutor:
                 source_clock=result.feedback_clock, message=result.message)
         return result
 
-    def stop(self):
-        self.command_sink.stop()
-
-    def close(self):
+    def close(self, *, fault=False):
         try:
-            self.command_sink.stop()
+            if fault:
+                self.command_sink.fault_stop()
+            else:
+                self.command_sink.stop()
         finally:
             self.runner.close()

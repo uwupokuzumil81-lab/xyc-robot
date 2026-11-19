@@ -2,6 +2,7 @@ from xyc.assets import follower_calibration_ids
 """Cross-model data requirements and live execution without physical drivers."""
 
 import json
+import threading
 
 import cv2
 import numpy as np
@@ -145,7 +146,7 @@ class FakeCameras:
 class FakeSink:
     def __init__(self, cameras, ids):
         self.cameras, self.ids = cameras, ids
-        self.sent, self.stopped, self.started = [], False, False
+        self.sent, self.stopped, self.started, self.faulted = [], False, False, False
         self.offset_ns = 0
 
     def status(self):
@@ -162,7 +163,18 @@ class FakeSink:
         self.started = True
         return self.status()
 
-    def dispatch(self, command, *, sequence, valid_for_s):
+    def heartbeat(self):
+        return self.status()
+
+    def hold(self):
+        state = self.status()
+        self.sent.append({'arm_position_normalized': state['state'][:14],
+                          'mobile_command': dict.fromkeys(('lift', 'x', 'y', 'yaw'), 0.)})
+        return state
+
+    def dispatch(self, command, *, sequence, valid_for_s, before_send=None):
+        if before_send is not None and not before_send():
+            return None
         self.sent.append(command)
         return CommandResult(accepted=True, command_id=str(sequence), feedback_state=self.status()['state'],
                              source_time_ns=123, source_clock='pc_wall', feedback_time_ns=124,
@@ -170,6 +182,9 @@ class FakeSink:
 
     def stop(self):
         self.stopped = True
+
+    def fault_stop(self):
+        self.faulted = self.stopped = True
 
 
 def live_fixture(monkeypatch):
@@ -224,7 +239,17 @@ def test_observation_end_includes_state_read_completion_time(monkeypatch):
 
 
 def test_live_deploy_records_prediction_sent_command_feedback_and_rgb(monkeypatch, tmp_path):
+    from xyc.learning import inference_recording
+
     adapter, _, _, sink = live_fixture(monkeypatch)
+    decode_jpeg = inference_recording.decode_jpeg
+    decoding_threads = []
+
+    def decode_in_writer(data):
+        decoding_threads.append(threading.get_ident())
+        return decode_jpeg(data)
+
+    monkeypatch.setattr(inference_recording, 'decode_jpeg', decode_in_writer)
     result = deployment.deploy('test', interactive=False, device='cpu', steps=3, record_dir=tmp_path / 'trace', record_video=True)
     assert sink.started and sink.stopped and len(sink.sent) == 3
     assert len(adapter.observation['state_stamps_ns']) == 18
@@ -234,10 +259,46 @@ def test_live_deploy_records_prediction_sent_command_feedback_and_rgb(monkeypatc
     assert all(meta['written'][kind] == 3 for kind in ('selection', 'execution', 'feedback'))
     assert meta['video_frames_per_camera'] == 3
     assert set(meta['video_shapes']) == set(CAMERAS)
+    assert len(decoding_threads) == 3 * len(CAMERAS)
+    assert threading.get_ident() not in decoding_threads
     rows = pq.read_table(tmp_path / 'trace/steps.parquet').to_pylist()
     selections = [row for row in rows if row['record_kind'] == 'selection']
     assert len(json.loads(selections[0]['observation_json'])['state_stamps_ns']) == 18
     assert all(row['driver_accepted'] for row in rows if row['record_kind'] == 'execution')
+
+
+def test_deploy_cli_overrides_queue_length_without_changing_prediction_horizon(monkeypatch, tmp_path):
+    from xyc.learning.cli import main
+
+    adapter, _, _, sink = live_fixture(monkeypatch)
+    trace = tmp_path / 'override'
+    assert main(['deploy', '--checkpoint', 'test', '--device', 'cpu', '--auto-start',
+                 '--steps', '4', '--action-steps', '3', '--record-dir', str(trace)]) == 0
+    assert len(sink.sent) == 4 and sink.stopped
+    assert adapter.chunk_execution_spec().action_steps == 2
+    meta = json.loads((trace / 'meta.json').read_text())
+    assert meta['context']['action_steps_override'] == 3
+    predictions = pq.read_table(trace / 'predictions.parquet').to_pylist()
+    assert len(predictions) == 3 and all(len(row['actions']) == 4 for row in predictions)
+    steps = pq.read_table(trace / 'steps.parquet').to_pylist()
+    assert [row['chunk_index'] for row in steps if row['record_kind'] == 'selection'] == [0, 1, 2, 0]
+
+
+@pytest.mark.parametrize('action_steps,strategy,message', [
+    (0, 'sync_chunk', '1 to 4'),
+    (5, 'sync_chunk', '1 to 4'),
+    (2, 'rtc', 'requires --strategy sync_chunk'),
+])
+def test_invalid_live_action_steps_fail_before_connect(monkeypatch, action_steps, strategy, message):
+    live_fixture(monkeypatch)
+
+    def unexpected_connection(*args):
+        pytest.fail('Invalid execution steps tried to connect to the robot')
+
+    monkeypatch.setattr(deployment, 'RobotControlSink', unexpected_connection)
+    with pytest.raises(ValueError, match=message):
+        deployment.deploy('test', interactive=False, device='cpu', record=False,
+                          action_steps=action_steps, strategy=strategy)
 
 
 def test_live_failure_stops_sink_and_finalizes_trace(monkeypatch, tmp_path):
@@ -248,6 +309,81 @@ def test_live_failure_stops_sink_and_finalizes_trace(monkeypatch, tmp_path):
     assert sink.stopped and not sink.sent
     meta = json.loads((tmp_path / 'failed/meta.json').read_text())
     assert meta['status'] == 'failed' and meta['writer_error'] is None
+
+
+def test_live_rtc_worker_error_stops_shared_sink(monkeypatch, tmp_path):
+    from xyc.runtime.strategies.base import RTCChunk
+
+    adapter, _, _, sink = live_fixture(monkeypatch)
+    adapter.chunk_execution_spec = lambda: ChunkExecutionSpec(2, 12)
+
+    def predict_rtc(batch, *, previous, **kwargs):
+        if previous is not None:
+            raise RuntimeError('failed RTC inference')
+        actions = torch.zeros(1, 12, 18)
+        return RTCChunk(actions, actions)
+
+    adapter.predict_rtc_chunk = predict_rtc
+    trace = tmp_path / 'rtc-error'
+    with pytest.raises(RuntimeError, match='failed RTC inference'):
+        deployment.deploy('test', interactive=False, device='cpu', strategy='rtc',
+                          steps=10, record_dir=trace)
+    assert sink.started and sink.faulted and 2 <= len(sink.sent) < 10
+    assert all(command['observation_time_ns'] > 0 for command in sink.sent)
+    meta = json.loads((trace / 'meta.json').read_text())
+    assert meta['status'] == 'failed' and meta['context']['strategy'] == 'rtc'
+    assert meta['written']['prediction'] == 1
+
+
+def test_live_rtc_dispatches_while_next_model_call_waits(monkeypatch, tmp_path):
+    from xyc.runtime.strategies.base import RTCChunk
+
+    adapter, _, _, sink = live_fixture(monkeypatch)
+    adapter.chunk_execution_spec = lambda: ChunkExecutionSpec(2, 24)
+    release = threading.Event()
+    dispatch = sink.dispatch
+    original_indices = torch.arange(24).float()
+
+    guidance = []
+
+    def predict_rtc(batch, *, previous, execution_horizon, **kwargs):
+        values = original_indices
+        if previous is not None:
+            guidance.append(execution_horizon)
+            if len(guidance) == 1:
+                assert release.wait(3)
+                values = values + 50  # This candidate missed the guided prefix.
+            else:
+                values = values + 75
+        actions = torch.zeros(1, 24, 18)
+        actions[0, :, 0] = values
+        return RTCChunk(actions, actions)
+
+    def dispatch_while_pending(command, *, sequence, valid_for_s, before_send=None):
+        assert 0 < valid_for_s <= .25
+        result = dispatch(command, sequence=sequence, valid_for_s=valid_for_s, before_send=before_send)
+        if len(sink.sent) == 12:
+            release.set()
+        return result
+
+    adapter.predict_rtc_chunk = predict_rtc
+    monkeypatch.setattr(sink, 'dispatch', dispatch_while_pending)
+    trace = tmp_path / 'rtc-overlap'
+    try:
+        result = deployment.deploy('test', interactive=False, device='cpu', strategy='rtc',
+                                   steps=16, record_dir=trace)
+    finally:
+        release.set()
+    assert sink.stopped and result['frames'] == 16
+    sent = [command['arm_position_normalized'][0] for command in sink.sent]
+    assert sent[:12] == list(range(12))
+    assert all(value < 24 or value >= 75 for value in sent)
+    first_new = next(i for i, value in enumerate(sent) if value >= 75)
+    assert guidance[0] == 3 and guidance[1] > guidance[0]
+    rows = pq.read_table(trace / 'steps.parquet').to_pylist()
+    selected = [row for row in rows if row['record_kind'] == 'selection']
+    assert selected[first_new]['chunk_index'] == sent[first_new] - 75
+    assert selected[first_new]['prediction_id'] != selected[0]['prediction_id']
 
 
 def test_language_requirement_and_trace_directory_checked_before_connect(monkeypatch, tmp_path):
